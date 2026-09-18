@@ -49,8 +49,14 @@ type Config struct {
 	BaseURL   string `yaml:"base-url"`
 }
 
-func resolveBaseURL() (string, error) {
-	value := strings.TrimSpace(os.Getenv("BASE_URL"))
+func resolveBaseURL(requestOverride ...string) (string, error) {
+	value := ""
+	if len(requestOverride) > 0 {
+		value = strings.TrimSpace(requestOverride[0])
+	}
+	if value == "" {
+		value = strings.TrimSpace(os.Getenv("BASE_URL"))
+	}
 	if value == "" && Cfg != nil {
 		value = strings.TrimSpace(Cfg.BaseURL)
 	}
@@ -60,13 +66,20 @@ func resolveBaseURL() (string, error) {
 	value = strings.TrimRight(value, "/")
 	parsed, err := url.Parse(value)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-		return "", fmt.Errorf("base-url must be a valid http:// or https:// URL")
+		return "", fmt.Errorf("base URL must be a valid http:// or https:// URL")
 	}
 	return value, nil
 }
 
-func zenEndpoint(path string) (string, error) {
-	base, err := resolveBaseURL()
+func requestBaseURL(r *http.Request) string {
+	if value := strings.TrimSpace(r.Header.Get("X-OpenCode-Base-URL")); value != "" {
+		return value
+	}
+	return strings.TrimSpace(r.URL.Query().Get("base_url"))
+}
+
+func zenEndpoint(path string, requestOverride ...string) (string, error) {
+	base, err := resolveBaseURL(requestOverride...)
 	if err != nil {
 		return "", err
 	}
@@ -87,7 +100,7 @@ var (
 var CORSHeaders = map[string]string{
 	"Access-Control-Allow-Origin":  "*",
 	"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-	"Access-Control-Allow-Headers": "Authorization, X-API-Key, x-api-key, Content-Type, Anthropic-Version, Anthropic-Beta",
+	"Access-Control-Allow-Headers": "Authorization, X-API-Key, x-api-key, X-OpenCode-Base-URL, Content-Type, Anthropic-Version, Anthropic-Beta",
 }
 
 var JSONRespHeaders = map[string]string{
@@ -428,8 +441,8 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 	writeOpenAIError(w, prefix+msg, errType, status, "")
 }
 
-func fetchZenModels() ([]map[string]interface{}, error) {
-	modelsURL, err := zenEndpoint("models")
+func fetchZenModels(requestOverride ...string) ([]map[string]interface{}, error) {
+	modelsURL, err := zenEndpoint("models", requestOverride...)
 	if err != nil {
 		return nil, err
 	}
@@ -497,7 +510,10 @@ func isAllowedModelId(id string) bool {
 	return id == "big-pickle" || strings.HasSuffix(id, "-free")
 }
 
-func getAvailableModels() ([]map[string]interface{}, error) {
+func getAvailableModels(requestOverride ...string) ([]map[string]interface{}, error) {
+	if len(requestOverride) > 0 && strings.TrimSpace(requestOverride[0]) != "" {
+		return fetchZenModels(requestOverride...)
+	}
 	CachedModelsMu.RLock()
 	if CachedModels != nil {
 		defer CachedModelsMu.RUnlock()
@@ -839,8 +855,8 @@ func buildZenRequest(model string, messages, tools []interface{}, toolChoice int
 	}
 }
 
-func fetchZen(ctx context.Context, zenReq *zenRequest) (*http.Response, error) {
-	chatURL, err := zenEndpoint("chat/completions")
+func fetchZen(ctx context.Context, zenReq *zenRequest, requestOverride ...string) (*http.Response, error) {
+	chatURL, err := zenEndpoint("chat/completions", requestOverride...)
 	if err != nil {
 		return nil, err
 	}
@@ -1141,9 +1157,10 @@ func HandleOpenAI(w http.ResponseWriter, r *http.Request, env string) {
 
 	// Zen 免费层要求 OpenCode 风格的流式请求；客户端是否 stream 由下游响应层决定。
 	zenReq := buildZenRequest(upstreamModel, transformedMessages, tools, toolChoice, reasoningEffort, sessionId, true, maxTokens)
+	baseURL := requestBaseURL(r)
 	logZenRequest(requestId, "openai", model, stream, user, zenReq, len(messages))
 
-	upstream, err := fetchZen(r.Context(), zenReq)
+	upstream, err := fetchZen(r.Context(), zenReq, baseURL)
 	if err != nil {
 		debugLog("[ZEN FETCH ERROR]", map[string]interface{}{
 			"requestId": requestId, "model": upstreamModel, "stream": stream,
@@ -1635,7 +1652,7 @@ func ModelsResponse(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = user
 
-	models, err := getAvailableModels()
+	models, err := getAvailableModels(requestBaseURL(r))
 	if err != nil {
 		debugLog("[MODEL LIST ERROR]", map[string]interface{}{"message": err.Error()})
 		writeUpstreamError(w, err)

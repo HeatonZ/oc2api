@@ -95,3 +95,55 @@ func TestFetchZenUsesConfiguredHTTPBaseURL(t *testing.T) {
 		t.Fatalf("upstream body = %q", gotBody)
 	}
 }
+
+func TestRequestBaseURLPriority(t *testing.T) {
+	queryReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions?base_url=http%3A%2F%2Fquery.example", nil)
+	if got := requestBaseURL(queryReq); got != "http://query.example" {
+		t.Fatalf("query base URL = %q", got)
+	}
+
+	headerReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions?base_url=http%3A%2F%2Fquery.example", nil)
+	headerReq.Header.Set("X-OpenCode-Base-URL", "https://header.example/zen/v1")
+	if got := requestBaseURL(headerReq); got != "https://header.example/zen/v1" {
+		t.Fatalf("header base URL = %q", got)
+	}
+
+	invalidReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions?base_url=ftp%3A%2F%2Fbad.example", nil)
+	if _, err := zenEndpoint("models", requestBaseURL(invalidReq)); err == nil {
+		t.Fatal("invalid request base URL was accepted")
+	}
+}
+
+func TestFetchZenUsesRequestBaseURLOverride(t *testing.T) {
+	oldCfg, oldClient := Cfg, zenHTTPClient
+	defer func() {
+		Cfg = oldCfg
+		zenHTTPClient = oldClient
+	}()
+
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {}\\n\\ndata: [DONE]\\n\\n"))
+	}))
+	defer upstream.Close()
+
+	Cfg = &Config{BaseURL: "https://config.example"}
+	zenHTTPClient = upstream.Client()
+	resp, err := fetchZen(context.Background(), &zenRequest{
+		Body:    `{\"model\":\"big-pickle\"}`,
+		Headers: map[string]string{"Content-Type": "application/json"},
+	}, upstream.URL)
+	if err != nil {
+		t.Fatalf("fetchZen() override error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("fetchZen() override status = %d, want 200", resp.StatusCode)
+	}
+	if gotPath != "/zen/v1/chat/completions" {
+		t.Fatalf("override upstream path = %q", gotPath)
+	}
+}

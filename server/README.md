@@ -32,7 +32,21 @@ base-url: "http://你的反代地址"
 BASE_URL="http://你的反代地址" docker compose up -d --build
 ```
 
-`BASE_URL`/`base-url` 可以填写上游根地址，例如 `http://proxy.example`，程序会访问 `/zen/v1/chat/completions` 和 `/zen/v1/models`；也可以直接填写已经带 `/zen/v1` 的地址。支持 `http://` 和 `https://`。
+`BASE_URL`/`base-url` 是部署级默认值，可以填写上游根地址，例如 `http://proxy.example`，程序会访问 `/zen/v1/chat/completions` 和 `/zen/v1/models`；也可以直接填写已经带 `/zen/v1` 的地址。支持 `http://` 和 `https://`。
+
+Sub2API 如果需要每个请求选择不同反代，可使用请求级覆盖：
+
+```text
+X-OpenCode-Base-URL: http://proxy-a.example
+```
+
+或者把地址作为 URL 参数（需要 URL 编码）：
+
+```text
+POST /v1/chat/completions?base_url=http%3A%2F%2Fproxy-a.example
+```
+
+优先级为：`X-OpenCode-Base-URL` Header > `base_url` URL 参数 > `BASE_URL`/`base-url` > 默认 `https://opencode.ai`。请求级地址只允许 `http://` 和 `https://`，不会被转发给上游。
 ## 本地部署
 
 ```bash

@@ -25,6 +25,20 @@ OpenCode API 代理，部署在 Vercel，支持 SSE 流式响应。
 
 部署完成后会得到一个 `https://<项目名>.vercel.app` 的域名。
 
+Sub2API 如果需要每个请求选择不同反代，可在发往本服务的请求中加入：
+
+```text
+X-OpenCode-Base-URL: http://proxy-a.example
+```
+
+也可以使用 URL 参数（需要 URL 编码）：
+
+```text
+POST /v1/chat/completions?base_url=http%3A%2F%2Fproxy-a.example
+```
+
+优先级为：`X-OpenCode-Base-URL` Header > `base_url` URL 参数 > Vercel 环境变量 `BASE_URL` > 默认 `https://opencode.ai`。请求级地址只允许 `http://` 和 `https://`。
+
 你可以 Fork 后部署多个 Vercel Project，以创建多个出口 IP 不同的项目，然后在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/blob/main/README_CN.md#%E5%8A%9F%E8%83%BD%E7%89%B9%E6%80%A7)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api/blob/main/README_CN.md#%E9%83%A8%E7%BD%B2%E6%96%B9%E5%BC%8F)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api/blob/main/README.zh_CN.md#-%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B) 等工具中配置多个域名实现轮询，规避 IP 限制。
 
 ## API
