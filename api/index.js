@@ -1,8 +1,28 @@
 const OC_VERSION = "1.18.31";
 const PROXY_VERSION = "v1.7.0";
-const ZEN_BASE_URL = "https://opencode.ai";
-const ZEN_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`;
-const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`;
+const DEFAULT_BASE_URL = "https://opencode.ai";
+
+function resolveBaseURL() {
+	const configured = String(process.env.BASE_URL || "").trim();
+	const value = (configured || DEFAULT_BASE_URL).replace(/\/+$/, "");
+	let parsed;
+	try {
+		parsed = new URL(value);
+	} catch {
+		throw new Error("BASE_URL must be a valid http:// or https:// URL");
+	}
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+		throw new Error("BASE_URL must use http:// or https://");
+	}
+	if (!parsed.host) throw new Error("BASE_URL must include a host");
+	return value;
+}
+
+function zenEndpoint(path) {
+	const base = resolveBaseURL();
+	if (base.endsWith("/zen/v1")) return `${base}/${path}`;
+	return `${base}/zen/v1/${path}`;
+}
 const FETCH_TIMEOUT_MS = 5 * 60 * 1000;
 const IMAGE_FALLBACK_MODEL = "mimo-v2.5-free"; // DeepSeek 不支持图片,带图请求路由到该带图模型
 
@@ -265,7 +285,7 @@ async function fetchZenModels() {
 
 	try {
 		const started = Date.now();
-		const response = await fetch(ZEN_MODELS_URL, {
+		const response = await fetch(zenEndpoint("models"), {
 			method: "GET",
 			headers: {
 				"Accept": "application/json",
@@ -441,7 +461,7 @@ async function fetchZen(zenReq, requestId, model, stream) {
 
 	try {
 		const started = Date.now();
-		const response = await fetch(ZEN_URL, {
+		const response = await fetch(zenEndpoint("chat/completions"), {
 			method: "POST",
 			headers: zenReq.headers,
 			body: zenReq.body,

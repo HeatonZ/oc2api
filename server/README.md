@@ -10,9 +10,29 @@
 |--------------|----------------|------------------|
 | `port`       | `8080`         | 监听端口             |
 | `api-key`    | 空              | API 密钥（不设置则匿名访问） |
-| `debug`      | `false`        | 调试日志             |
-| `timeout-ms` | `300000` (5分钟) | 上游请求超时时间         |
+| `debug`     | `false`        | 调试日志 |
+| `timeout-ms` | `300000` (5分钟) | 上游请求超时时间 |
+| `base-url`  | `https://opencode.ai` | 上游根地址，支持 `http://` 或 `https://`；环境变量 `BASE_URL` 优先 |
 
+## 配置示例
+
+`config.yaml`：
+
+```yaml
+port: 8080
+api-key: "change-me"
+debug: false
+timeout-ms: 300000
+base-url: "http://你的反代地址"
+```
+
+也可以用环境变量覆盖配置文件中的上游地址：
+
+```bash
+BASE_URL="http://你的反代地址" docker compose up -d --build
+```
+
+`BASE_URL`/`base-url` 可以填写上游根地址，例如 `http://proxy.example`，程序会访问 `/zen/v1/chat/completions` 和 `/zen/v1/models`；也可以直接填写已经带 `/zen/v1` 的地址。支持 `http://` 和 `https://`。
 ## 本地部署
 
 ```bash

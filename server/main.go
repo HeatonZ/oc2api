@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -36,8 +37,6 @@ const (
 	// 上游抬高门槛时可用环境变量 OC_VERSION 覆盖, 无需改代码重新构建。
 	OCVersion          = "1.18.31"
 	ZenBaseURL         = "https://opencode.ai"
-	ZenURL             = ZenBaseURL + "/zen/v1/chat/completions"
-	ZenModelsURL       = ZenBaseURL + "/zen/v1/models"
 	defaultTimeout     = 5 * time.Minute
 	ImageFallbackModel = "mimo-v2.5-free" // DeepSeek 不支持图片,带图请求路由到该带图模型
 )
@@ -47,6 +46,34 @@ type Config struct {
 	APIKey    string `yaml:"api-key"`
 	Debug     bool   `yaml:"debug"`
 	TimeoutMs int    `yaml:"timeout-ms"`
+	BaseURL   string `yaml:"base-url"`
+}
+
+func resolveBaseURL() (string, error) {
+	value := strings.TrimSpace(os.Getenv("BASE_URL"))
+	if value == "" && Cfg != nil {
+		value = strings.TrimSpace(Cfg.BaseURL)
+	}
+	if value == "" {
+		value = ZenBaseURL
+	}
+	value = strings.TrimRight(value, "/")
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", fmt.Errorf("base-url must be a valid http:// or https:// URL")
+	}
+	return value, nil
+}
+
+func zenEndpoint(path string) (string, error) {
+	base, err := resolveBaseURL()
+	if err != nil {
+		return "", err
+	}
+	if strings.HasSuffix(base, "/zen/v1") {
+		return base + "/" + path, nil
+	}
+	return base + "/zen/v1/" + path, nil
 }
 
 var (
@@ -402,10 +429,14 @@ func writeUpstreamError(w http.ResponseWriter, err error) {
 }
 
 func fetchZenModels() ([]map[string]interface{}, error) {
+	modelsURL, err := zenEndpoint("models")
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), ResolveTimeout(Cfg))
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, "GET", ZenModelsURL, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", modelsURL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -809,7 +840,11 @@ func buildZenRequest(model string, messages, tools []interface{}, toolChoice int
 }
 
 func fetchZen(ctx context.Context, zenReq *zenRequest) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, "POST", ZenURL, strings.NewReader(zenReq.Body))
+	chatURL, err := zenEndpoint("chat/completions")
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, "POST", chatURL, strings.NewReader(zenReq.Body))
 	if err != nil {
 		return nil, err
 	}

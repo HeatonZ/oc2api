@@ -10,7 +10,7 @@ OpenCode API 代理，部署在 Vercel，支持 SSE 流式响应。
 
 ### 一键部署
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fzhuweiyou%2Foc2api&env=API_KEY%2CDEBUG&envDefaults=%7B%22API_KEY%22%3A%22sk-zhu%22%2C%22DEBUG%22%3A%22true%22%7D&envDescription=API_KEY%EF%BC%9AAPI%20%E5%AF%86%E9%92%A5%EF%BC%88%E7%95%99%E7%A9%BA%E5%88%99%E5%8C%BF%E5%90%8D%E8%AE%BF%E9%97%AE%EF%BC%89%EF%BC%9BDEBUG%EF%BC%9A%E8%AE%BE%E4%B8%BA%20true%20%E5%BC%80%E5%90%AF%E8%B0%83%E8%AF%95%E6%97%A5%E5%BF%97&envLink=https%3A%2F%2Fgithub.com%2Fzhuweiyou%2Foc2api%23%E9%83%A8%E7%BD%B2)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FHeatonZ%2Foc2api&env=API_KEY%2CBASE_URL%2CDEBUG&envDefaults=%7B%22API_KEY%22%3A%22change-me%22%2C%22BASE_URL%22%3A%22https%3A%2F%2Fopencode.ai%22%2C%22DEBUG%22%3A%22false%22%7D&envDescription=API_KEY%EF%BC%9AAPI%20%E5%AF%86%E9%92%A5%EF%BC%9BBASE_URL%EF%BC%9AOpenCode%20%E6%88%96%E5%8F%8D%E4%BB%A3%E6%A0%B9%E5%9C%B0%E5%9D%80%EF%BC%88%E6%94%AF%E6%8C%81%20http%2Fhttps%EF%BC%89%EF%BC%9BDEBUG%EF%BC%9A%E8%B0%83%E8%AF%95%E6%97%A5%E5%BF%97%EF%BC%88%E9%BB%98%E8%AE%A4%E5%85%B3%E9%97%AD%EF%BC%89&envLink=https%3A%2F%2Fgithub.com%2FHeatonZ%2Foc2api%23%E9%83%A8%E7%BD%B2)
 
 ### 手动部署
 
@@ -19,6 +19,7 @@ OpenCode API 代理，部署在 Vercel，支持 SSE 流式响应。
 3. 选择你 Fork 的仓库，点击 **Import**
 4. 在 **Environment Variables** 中添加：
     - `API_KEY` — API 密钥（留空则匿名访问）
+    - `BASE_URL` — 可选的 OpenCode/反代根地址，支持 `http://` 或 `https://`；留空默认 `https://opencode.ai`
     - `DEBUG` — 设为 `true` 开启调试日志（可选）
 5. 点击 **Deploy**，等待部署完成
 
