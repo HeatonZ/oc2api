@@ -14,7 +14,7 @@ OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本�
 
 ### 一键部署
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fzhuweiyou%2Foc2api&env=API_KEY%2CDEBUG&envDefaults=%7B%22API_KEY%22%3A%22sk-zhu%22%2C%22DEBUG%22%3A%22true%22%7D&envDescription=API_KEY%EF%BC%9AAPI%20%E5%AF%86%E9%92%A5%EF%BC%88%E7%95%99%E7%A9%BA%E5%88%99%E5%8C%BF%E5%90%8D%E8%AE%BF%E9%97%AE%EF%BC%89%EF%BC%9BDEBUG%EF%BC%9A%E8%AE%BE%E4%B8%BA%20true%20%E5%BC%80%E5%90%AF%E8%B0%83%E8%AF%95%E6%97%A5%E5%BF%97&envLink=https%3A%2F%2Fgithub.com%2Fzhuweiyou%2Foc2api%23vercel-%E9%83%A8%E7%BD%B2)
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FHeatonZ%2Foc2api&env=API_KEY%2CBASE_URL%2CDEBUG&envDefaults=%7B%22API_KEY%22%3A%22change-me%22%2C%22BASE_URL%22%3A%22https%3A%2F%2Fopencode.ai%22%2C%22DEBUG%22%3A%22false%22%7D&envDescription=API_KEY%EF%BC%9AAPI%20%E5%AF%86%E9%92%A5%EF%BC%9BBASE_URL%EF%BC%9AOpenCode%20%E6%88%96%E5%8F%8D%E4%BB%A3%E6%A0%B9%E5%9C%B0%E5%9D%80%EF%BC%88%E6%94%AF%E6%8C%81%20http%2Fhttps%EF%BC%89%EF%BC%9BDEBUG%EF%BC%9A%E8%B0%83%E8%AF%95%E6%97%A5%E5%BF%97%EF%BC%88%E9%BB%98%E8%AE%A4%E5%85%B3%E9%97%AD%EF%BC%89&envLink=https%3A%2F%2Fgithub.com%2FHeatonZ%2Foc2api%23%E9%83%A8%E7%BD%B2)
 
 ### 手动部署
 
@@ -23,12 +23,46 @@ OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本�
 3. 选择你 Fork 的仓库，点击 **Import**
 4. 在 **Environment Variables** 中添加：
    - `API_KEY` — API 密钥（留空则匿名访问）
+   - `BASE_URL` — 可选的 OpenCode/反代根地址，支持 `http://` 或 `https://`；留空默认 `https://opencode.ai`
    - `DEBUG` — 设为 `true` 开启调试日志（可选）
 5. 点击 **Deploy**，等待部署完成
 
 部署完成后会得到一个 `https://<项目名>.vercel.app` 的域名。
 
-你可以 Fork 后部署多个 Vercel Project，以创建多个出口 IP 不同的项目，然后在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/blob/main/README_CN.md#%E5%8A%9F%E8%83%BD%E7%89%B9%E6%80%A7)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api/blob/main/README.zh_CN.md#%E9%83%A8%E7%BD%B2%E6%96%B9%E5%BC%8F)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api/blob/main/README.zh_CN.md#-%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B) 等工具中配置多个域名实现轮询，规避 IP 限制。
+Sub2API 如果需要每个请求选择不同反代，可在发往本服务的请求中加入：
+
+```text
+X-OpenCode-Base-URL: http://proxy-a.example
+```
+
+也可以使用 URL 参数（需要 URL 编码）：
+
+```text
+POST /v1/chat/completions?base_url=http%3A%2F%2Fproxy-a.example
+```
+
+优先级为：`X-OpenCode-Base-URL` Header > `base_url` URL 参数 > Vercel 环境变量 `BASE_URL` > 默认 `https://opencode.ai`。请求级地址只允许 `http://` 和 `https://`。
+
+你可以 Fork 后部署多个 Vercel Project，以创建多个出口 IP 不同的项目，然后在 [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI/blob/main/README_CN.md#%E5%8A%9F%E8%83%BD%E7%89%B9%E6%80%A7)、[Wei-Shaw/sub2api](https://github.com/Wei-Shaw/sub2api/blob/main/README_CN.md#%E9%83%A8%E7%BD%B2%E6%96%B9%E5%BC%8F)、[QuantumNous/new-api](https://github.com/QuantumNous/new-api/blob/main/README.zh_CN.md#-%E5%BF%AB%E9%80%9F%E5%BC%80%E5%A7%8B) 等工具中配置多个域名实现轮询，规避 IP 限制。
+
+## API
+
+兼容 OpenAI API 格式，路径均支持带 `/v1` 前缀或不带：
+
+| 路径                                          | 方法 | 说明                                  |
+| --------------------------------------------- | ---- | ------------------------------------- |
+| `/v1/chat/completions` 或 `/chat/completions` | POST | Chat 补全（支持 `stream: true` 流式） |
+| `/v1/models` 或 `/models`                     | GET  | 模型列表                              |
+| `/` 或 `/health`                              | GET  | 健康检查                              |
+| `/ip`                                         | GET  | 查询出口 IP                           |
+
+配置 API Key 后，请求携带：
+
+```text
+Authorization: Bearer <api-key>
+```
+
+也支持 `X-API-Key`。
 
 ## 本地运行
 
@@ -84,25 +118,6 @@ npm run format        # 用 Prettier 自动格式化全部文件
 ```
 
 GitHub Actions 与 Docker 构建都会先执行 lint 和格式检查，不通过则构建失败。
-
-## API
-
-兼容 OpenAI API 格式，路径均支持带 `/v1` 前缀或不带：
-
-| 路径                                          | 方法 | 说明                                  |
-| --------------------------------------------- | ---- | ------------------------------------- |
-| `/v1/chat/completions` 或 `/chat/completions` | POST | Chat 补全（支持 `stream: true` 流式） |
-| `/v1/models` 或 `/models`                     | GET  | 模型列表                              |
-| `/` 或 `/health`                              | GET  | 健康检查                              |
-| `/ip`                                         | GET  | 查询出口 IP                           |
-
-配置 API Key 后，请求携带：
-
-```text
-Authorization: Bearer <api-key>
-```
-
-也支持 `X-API-Key`。
 
 ## 免费模型限制
 
