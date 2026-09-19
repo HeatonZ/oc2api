@@ -264,3 +264,90 @@ function restoreEnv(name, value) {
   if (value === undefined) delete process.env[name]
   else process.env[name] = value
 }
+
+test("resolveBaseURL falls back to env BASE_URL and default, validates scheme and host", () => {
+  const previousBaseUrl = process.env.BASE_URL
+  try {
+    delete process.env.BASE_URL
+    assert.equal(__test.resolveBaseURL(""), "https://opencode.ai")
+    assert.equal(__test.resolveBaseURL("https://mirror.example.com"), "https://mirror.example.com")
+    assert.equal(__test.resolveBaseURL("https://fake.resin.local/v1"), "https://fake.resin.local/v1")
+
+    process.env.BASE_URL = "https://deploy.example.com"
+    assert.equal(__test.resolveBaseURL(""), "https://deploy.example.com")
+    // 请求级 override 优先于部署级
+    assert.equal(__test.resolveBaseURL("https://req.example.net"), "https://req.example.net")
+
+    assert.throws(() => __test.resolveBaseURL("ftp://bad.example.com"), /must use http:\/\/ or https:\/\//)
+    assert.throws(() => __test.resolveBaseURL("not-a-url"), /must be a valid http:\/\/ or https:\/\/ URL/)
+  } finally {
+    restoreEnv("BASE_URL", previousBaseUrl)
+  }
+})
+
+test("requestBaseURL prefers header over query parameter", () => {
+  const withHeader = new Request("http://localhost/v1/models", {
+    headers: { "x-opencode-base-url": "https://header.example.com" },
+  })
+  assert.equal(__test.requestBaseURL(withHeader), "https://header.example.com")
+
+  const withQuery = new Request("http://localhost/v1/models?base_url=https%3A%2F%2Fquery.example.com")
+  assert.equal(__test.requestBaseURL(withQuery), "https://query.example.com")
+
+  const both = new Request("http://localhost/v1/models?base_url=https%3A%2F%2Fquery.example.com", {
+    headers: { "x-opencode-base-url": "https://header.example.com" },
+  })
+  assert.equal(__test.requestBaseURL(both), "https://header.example.com")
+
+  assert.equal(__test.requestBaseURL(new Request("http://localhost/v1/models")), "")
+})
+
+test("zenEndpoint builds zen paths from base URL and avoids duplicate /zen/v1", () => {
+  assert.equal(__test.zenEndpoint("chat/completions", ""), "https://opencode.ai/zen/v1/chat/completions")
+  assert.equal(
+    __test.zenEndpoint("chat/completions", "https://mirror.example.com"),
+    "https://mirror.example.com/zen/v1/chat/completions",
+  )
+  assert.equal(
+    __test.zenEndpoint("models", "https://mirror.example.com/zen/v1"),
+    "https://mirror.example.com/zen/v1/models",
+  )
+})
+
+test("per-request upstream base URL routes the chat request to the override host", async (t) => {
+  const previousFetch = globalThis.fetch
+  const previousApiKey = process.env.API_KEY
+  const calls = []
+  delete process.env.API_KEY
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init })
+    return new Response(mockSSEBody(), {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    })
+  }
+
+  const server = await listen(app)
+  t.after(() => {
+    close(server)
+    globalThis.fetch = previousFetch
+    restoreEnv("API_KEY", previousApiKey)
+  })
+
+  await request(server.url, {
+    method: "POST",
+    path: "/v1/chat/completions",
+    headers: {
+      "content-type": "application/json",
+      "x-opencode-base-url": "https://mirror.example.com",
+    },
+    body: JSON.stringify({
+      model: "big-pickle",
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+    }),
+  })
+
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].url, "https://mirror.example.com/zen/v1/chat/completions")
+})

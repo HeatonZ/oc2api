@@ -2,10 +2,46 @@ import express from "express"
 
 const OC_VERSION = "1.18.31"
 const PROXY_VERSION = "v2.0.0"
-const ZEN_BASE_URL = "https://opencode.ai"
-const ZEN_URL = `${ZEN_BASE_URL}/zen/v1/chat/completions`
-const ZEN_MODELS_URL = `${ZEN_BASE_URL}/zen/v1/models`
+const DEFAULT_BASE_URL = "https://opencode.ai"
 const FETCH_TIMEOUT_MS = 5 * 60 * 1000
+
+// 上游 Base URL 解析：请求级 override > 环境变量 BASE_URL / config base-url > 官方默认。
+// 返回去尾斜杠的 URL 字符串或抛出校验错误。
+function resolveBaseURL(requestOverride = "") {
+  const override = String(requestOverride || "").trim()
+  const configured = String(process.env.BASE_URL || "").trim()
+  const value = (override || configured || DEFAULT_BASE_URL).replace(/\/+$/, "")
+  let parsed
+  try {
+    parsed = new URL(value)
+  } catch {
+    throw new Error("base URL must be a valid http:// or https:// URL")
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("base URL must use http:// or https://")
+  }
+  if (!parsed.host) throw new Error("base URL must include a host")
+  return value
+}
+
+function requestBaseURL(request) {
+  const header = request?.headers?.get?.("x-opencode-base-url")?.trim()
+  if (header) return header
+  if (typeof request?.url === "string") {
+    try {
+      return new URL(request.url).searchParams.get("base_url")?.trim() || ""
+    } catch {
+      return ""
+    }
+  }
+  return ""
+}
+
+function zenEndpoint(relativePath, requestOverride = "") {
+  const base = resolveBaseURL(requestOverride)
+  if (base.endsWith("/zen/v1")) return `${base}/${relativePath}`
+  return `${base}/zen/v1/${relativePath}`
+}
 
 const userSessions = new Map()
 let cachedModels = null
@@ -14,7 +50,7 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers":
-    "Authorization, X-API-Key, x-api-key, Content-Type, Anthropic-Version, Anthropic-Beta",
+    "Authorization, X-API-Key, x-api-key, X-OpenCode-Base-URL, Content-Type, Anthropic-Version, Anthropic-Beta",
   "Access-Control-Expose-Headers": "X-Request-Id",
 }
 
@@ -56,7 +92,7 @@ async function handleRequest(request) {
     const auth = authenticate(request)
     if (auth.error) return auth.error
 
-    if (request.method === "GET" && (path === "/v1/models" || path === "/models")) return modelsResponse()
+    if (request.method === "GET" && (path === "/v1/models" || path === "/models")) return modelsResponse(request)
     if (request.method === "POST" && (path === "/v1/chat/completions" || path === "/chat/completions"))
       return handleOpenAI(request)
 
@@ -150,6 +186,8 @@ async function handleOpenAI(request) {
   const auth = authenticate(request)
   if (auth.error) return auth.error
 
+  const baseURL = requestBaseURL(request)
+
   const input = await readJson(request)
   if (input.error) return input.error
   if (!input.body || typeof input.body !== "object" || Array.isArray(input.body)) {
@@ -185,7 +223,7 @@ async function handleOpenAI(request) {
 
   let upstream
   try {
-    upstream = await fetchZen(zenReq, requestId, model, stream)
+    upstream = await fetchZen(zenReq, requestId, model, stream, baseURL)
   } catch (error) {
     debugLog("[ZEN FETCH ERROR]", { requestId, model, stream: !!stream, message: error?.message || String(error) })
     return upstreamErrorResponse(error)
@@ -250,11 +288,11 @@ function healthResponse() {
   })
 }
 
-async function modelsResponse() {
+async function modelsResponse(request) {
   try {
     return jsonResponse({
       object: "list",
-      data: await getAvailableModels(),
+      data: await getAvailableModels(requestBaseURL(request)),
     })
   } catch (error) {
     debugLog("[MODEL LIST ERROR]", { message: error?.message || String(error) })
@@ -262,19 +300,21 @@ async function modelsResponse() {
   }
 }
 
-async function getAvailableModels() {
+async function getAvailableModels(baseURL = "") {
+  // 请求级 base URL 不能复用部署级缓存，否则不同反代会拿到错误的模型列表。
+  if (baseURL) return fetchZenModels(baseURL)
   if (cachedModels) return cachedModels
   cachedModels = await fetchZenModels()
   return cachedModels
 }
 
-async function fetchZenModels() {
+async function fetchZenModels(baseURL = "") {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort("timeout"), FETCH_TIMEOUT_MS)
 
   try {
     const started = Date.now()
-    const response = await fetch(ZEN_MODELS_URL, {
+    const response = await fetch(zenEndpoint("models", baseURL), {
       method: "GET",
       headers: {
         Accept: "application/json",
@@ -396,13 +436,13 @@ function buildZenRequest(
   }
 }
 
-async function fetchZen(zenReq, requestId, model, stream) {
+async function fetchZen(zenReq, requestId, model, stream, baseURL = "") {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort("timeout"), FETCH_TIMEOUT_MS)
 
   try {
     const started = Date.now()
-    const response = await fetch(ZEN_URL, {
+    const response = await fetch(zenEndpoint("chat/completions", baseURL), {
       method: "POST",
       headers: zenReq.headers,
       body: zenReq.body,
@@ -885,7 +925,10 @@ export const __test = {
   buildZenRequest,
   createOpenAIStreamNormalizer,
   isAllowedModelId,
+  resolveBaseURL,
+  requestBaseURL,
   stripThinkBlocks,
+  zenEndpoint,
 }
 
 export default app

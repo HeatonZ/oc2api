@@ -9,4 +9,5 @@ services:
       PORT: "8080"
       API_KEY: "${API_KEY:-}"
       DEBUG: "${DEBUG:-false}"
+      BASE_URL: "${BASE_URL:-}"
     restart: always
