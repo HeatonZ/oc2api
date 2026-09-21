@@ -25,16 +25,7 @@ function resolveBaseURL(requestOverride = "") {
 }
 
 function requestBaseURL(request) {
-  const header = request?.headers?.get?.("x-opencode-base-url")?.trim()
-  if (header) return header
-  if (typeof request?.url === "string") {
-    try {
-      return new URL(request.url).searchParams.get("base_url")?.trim() || ""
-    } catch {
-      return ""
-    }
-  }
-  return ""
+  return request?.headers?.get?.("x-opencode-base-url")?.trim() || ""
 }
 
 function zenEndpoint(relativePath, requestOverride = "") {

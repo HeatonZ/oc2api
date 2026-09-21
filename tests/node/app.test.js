@@ -285,19 +285,14 @@ test("resolveBaseURL falls back to env BASE_URL and default, validates scheme an
   }
 })
 
-test("requestBaseURL prefers header over query parameter", () => {
+test("requestBaseURL reads only the request header", () => {
   const withHeader = new Request("http://localhost/v1/models", {
     headers: { "x-opencode-base-url": "https://header.example.com" },
   })
   assert.equal(__test.requestBaseURL(withHeader), "https://header.example.com")
 
   const withQuery = new Request("http://localhost/v1/models?base_url=https%3A%2F%2Fquery.example.com")
-  assert.equal(__test.requestBaseURL(withQuery), "https://query.example.com")
-
-  const both = new Request("http://localhost/v1/models?base_url=https%3A%2F%2Fquery.example.com", {
-    headers: { "x-opencode-base-url": "https://header.example.com" },
-  })
-  assert.equal(__test.requestBaseURL(both), "https://header.example.com")
+  assert.equal(__test.requestBaseURL(withQuery), "")
 
   assert.equal(__test.requestBaseURL(new Request("http://localhost/v1/models")), "")
 })
