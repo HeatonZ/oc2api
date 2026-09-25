@@ -3,12 +3,15 @@ import { createServer, request as httpRequest } from "node:http"
 import { once } from "node:events"
 import test from "node:test"
 
-import app, { __test } from "../../server/app.js"
+import app from "../../server/app.js"
+import { config } from "../../server/config.js"
+import { createOpenAIStreamNormalizer, stripThinkBlocks } from "../../server/openai.js"
+import { buildZenRequest } from "../../server/zen.js"
 
 // ==================== 流式归一化 ====================
 
 test("thinking on: merges reasoning fields into reasoning_content output", () => {
-  const normalizer = __test.createOpenAIStreamNormalizer("big-pickle", true)
+  const normalizer = createOpenAIStreamNormalizer("big-pickle", true)
   const chunk = normalizer.normalize({
     choices: [
       {
@@ -27,7 +30,7 @@ test("thinking on: merges reasoning fields into reasoning_content output", () =>
 })
 
 test("thinking on: strips think blocks from content and keeps them as reasoning_content", () => {
-  const normalizer = __test.createOpenAIStreamNormalizer("big-pickle", true)
+  const normalizer = createOpenAIStreamNormalizer("big-pickle", true)
   const chunk = normalizer.normalize({
     choices: [
       {
@@ -41,7 +44,7 @@ test("thinking on: strips think blocks from content and keeps them as reasoning_
 })
 
 test("thinking on: reasoning-only deltas (mimo style) become reasoning_content", () => {
-  const normalizer = __test.createOpenAIStreamNormalizer("mimo-v2.5-free", true)
+  const normalizer = createOpenAIStreamNormalizer("mimo-v2.5-free", true)
   const chunk = normalizer.normalize({
     choices: [{ index: 0, delta: { reasoning: "think text" } }],
   })
@@ -50,7 +53,7 @@ test("thinking on: reasoning-only deltas (mimo style) become reasoning_content",
 })
 
 test("thinking off: drops all reasoning fields and strips think blocks", () => {
-  const normalizer = __test.createOpenAIStreamNormalizer("big-pickle", false)
+  const normalizer = createOpenAIStreamNormalizer("big-pickle", false)
   const chunk = normalizer.normalize({
     choices: [
       {
@@ -68,7 +71,7 @@ test("thinking off: drops all reasoning fields and strips think blocks", () => {
 
 test("thinking off default: keeps behavior aligned with no reasoning_effort = on", () => {
   // thinkingEnabled 缺省视为开启（reasoning_effort 非 "none"）
-  const normalizer = __test.createOpenAIStreamNormalizer("big-pickle")
+  const normalizer = createOpenAIStreamNormalizer("big-pickle")
   const chunk = normalizer.normalize({
     choices: [{ index: 0, delta: { reasoning: "trace" } }],
   })
@@ -76,11 +79,11 @@ test("thinking off default: keeps behavior aligned with no reasoning_effort = on
 })
 
 test("stripThinkBlocks handles tag, marker, multi-block and unclosed forms", () => {
-  assert.equal(__test.stripThinkBlocks("<thinking>a</thinking>hi"), "hi")
-  assert.equal(__test.stripThinkBlocks(" pre<thinking>a</thinking>post<thinking>b</thinking>end "), "prepostend ")
-  assert.equal(__test.stripThinkBlocks("normal text"), "normal text")
+  assert.equal(stripThinkBlocks("<thinking>a</thinking>hi"), "hi")
+  assert.equal(stripThinkBlocks(" pre<thinking>a</thinking>post<thinking>b</thinking>end "), "prepostend ")
+  assert.equal(stripThinkBlocks("normal text"), "normal text")
   // 流式跨块:先开未闭,后续补上闭合标签
-  const closed = __test.stripThinkBlocks("<thinking>unclosed")
+  const closed = stripThinkBlocks("<thinking>unclosed")
   assert.equal(closed, "")
 })
 
@@ -88,20 +91,18 @@ test("stripThinkBlocks handles tag, marker, multi-block and unclosed forms", () 
 
 test("buildZenRequest passes reasoning_effort through unchanged", () => {
   const high = JSON.parse(
-    __test.buildZenRequest("big-pickle", [{ role: "user", content: "hi" }], true, null, null, "high", "ses_x", 32, null)
-      .body,
+    buildZenRequest("big-pickle", [{ role: "user", content: "hi" }], true, null, null, "high", "ses_x", 32, null).body,
   )
   assert.equal(high.reasoning_effort, "high")
 
   const none = JSON.parse(
-    __test.buildZenRequest("big-pickle", [{ role: "user", content: "hi" }], true, null, null, "none", "ses_x", 32, null)
-      .body,
+    buildZenRequest("big-pickle", [{ role: "user", content: "hi" }], true, null, null, "none", "ses_x", 32, null).body,
   )
   assert.equal(none.reasoning_effort, "none")
 })
 
 test("buildZenRequest omits reasoning_effort when not provided", () => {
-  const req = __test.buildZenRequest(
+  const req = buildZenRequest(
     "big-pickle",
     [{ role: "user", content: "hi" }],
     true,
@@ -139,9 +140,9 @@ function mockSSEBody({ thinking = true } = {}) {
 
 test("HTTP non-stream: thinking on emits reasoning_content, thinking off does not", async (t) => {
   const previousFetch = globalThis.fetch
-  const previousApiKey = process.env.API_KEY
+  const previousApiKey = config.apiKey
   const calls = []
-  delete process.env.API_KEY
+  config.apiKey = undefined
   globalThis.fetch = async (url, init) => {
     calls.push({ url: String(url), init })
     const thinking = (() => {
@@ -160,7 +161,7 @@ test("HTTP non-stream: thinking on emits reasoning_content, thinking off does no
   t.after(() => {
     close(server)
     globalThis.fetch = previousFetch
-    restoreEnv("API_KEY", previousApiKey)
+    config.apiKey = previousApiKey
   })
 
   const post = (body) =>
@@ -203,7 +204,7 @@ test("HTTP non-stream: thinking on emits reasoning_content, thinking off does no
 
 test("HTTP stream: thinking on streams reasoning_content deltas", async (t) => {
   const previousFetch = globalThis.fetch
-  delete process.env.API_KEY
+  config.apiKey = undefined
   globalThis.fetch = async () =>
     new Response(
       [
@@ -297,9 +298,4 @@ function request(baseURL, { method = "GET", path = "/", headers = {}, body } = {
     if (body !== undefined) outgoing.write(body)
     outgoing.end()
   })
-}
-
-function restoreEnv(name, value) {
-  if (value === undefined) delete process.env[name]
-  else process.env[name] = value
 }
