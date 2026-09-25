@@ -4,8 +4,10 @@ import { once } from "node:events"
 import test from "node:test"
 
 import vercelApp from "../../api/index.js"
-import localApp from "../../server/index.js"
-import app, { __test } from "../../server/app.js"
+import app from "../../server/app.js"
+import { config } from "../../server/config.js"
+import { createOpenAIStreamNormalizer } from "../../server/openai.js"
+import { buildZenRequest, requestBaseURL, resolveBaseURL, zenEndpoint } from "../../server/zen.js"
 
 const CUSTOM_TOOL = {
   type: "function",
@@ -21,8 +23,7 @@ const CUSTOM_TOOL = {
   },
 }
 
-test("local and Vercel entries export the same Express app", () => {
-  assert.strictEqual(localApp, app)
+test("Vercel entry exports the same Express app", () => {
   assert.strictEqual(vercelApp, app)
 })
 
@@ -44,13 +45,62 @@ test("health and OPTIONS responses work through the Express app", async (t) => {
   assert.equal(options.headers["access-control-allow-methods"], "GET, POST, OPTIONS")
 })
 
-test("invalid JSON returns an OpenAI error instead of Express HTML", async (t) => {
-  const previousApiKey = process.env.API_KEY
-  delete process.env.API_KEY
+test("unknown paths return 404 without going through auth", async (t) => {
+  const previousApiKey = config.apiKey
+  config.apiKey = "sk-test"
   const server = await listen(app)
   t.after(() => {
     close(server)
-    restoreEnv("API_KEY", previousApiKey)
+    config.apiKey = previousApiKey
+  })
+
+  // 不带 key：未注册路径不经过鉴权，直接 404
+  const noAuth = await request(server.url, { path: "/nope" })
+  assert.equal(noAuth.status, 404)
+  assert.deepEqual(JSON.parse(noAuth.text), { error: { message: "Not found" } })
+
+  // 带错误 key：同样 404，而不是 401
+  const wrongKey = await request(server.url, {
+    method: "POST",
+    path: "/nope",
+    headers: { authorization: "Bearer wrong", "content-type": "application/json" },
+    body: "{}",
+  })
+  assert.equal(wrongKey.status, 404)
+
+  // 已注册的受保护路径缺 key 仍是 401
+  const protectedNoAuth = await request(server.url, { path: "/v1/models" })
+  assert.equal(protectedNoAuth.status, 401)
+})
+
+test("public routes stay open when API_KEY is set, trailing slashes tolerated", async (t) => {
+  const previousApiKey = config.apiKey
+  const previousFetch = globalThis.fetch
+  config.apiKey = "sk-test"
+  // /ip 会访问外部服务商，离线测试里 mock 掉
+  globalThis.fetch = async () => new Response("your ip is 203.0.113.7", { status: 200 })
+  const server = await listen(app)
+  t.after(() => {
+    close(server)
+    config.apiKey = previousApiKey
+    globalThis.fetch = previousFetch
+  })
+
+  for (const path of ["/", "/health", "/ip", "/health//"]) {
+    const response = await request(server.url, { path })
+    assert.equal(response.status, 200, `expected 200 for ${path}`)
+  }
+  assert.equal(JSON.parse((await request(server.url, { path: "/health" })).text).status, "ok")
+  assert.equal(JSON.parse((await request(server.url, { path: "/ip" })).text).ip, "203.0.113.7")
+})
+
+test("invalid JSON returns an OpenAI error instead of Express HTML", async (t) => {
+  const previousApiKey = config.apiKey
+  config.apiKey = undefined
+  const server = await listen(app)
+  t.after(() => {
+    close(server)
+    config.apiKey = previousApiKey
   })
 
   const response = await request(server.url, {
@@ -67,9 +117,9 @@ test("invalid JSON returns an OpenAI error instead of Express HTML", async (t) =
 })
 
 test("API key authentication rejects missing and wrong keys with 401", async (t) => {
-  const previousApiKey = process.env.API_KEY
+  const previousApiKey = config.apiKey
   const previousFetch = globalThis.fetch
-  process.env.API_KEY = "sk-test"
+  config.apiKey = "sk-test"
   globalThis.fetch = async () =>
     new Response(mockSSEBody(), {
       status: 200,
@@ -78,7 +128,7 @@ test("API key authentication rejects missing and wrong keys with 401", async (t)
   const server = await listen(app)
   t.after(() => {
     close(server)
-    restoreEnv("API_KEY", previousApiKey)
+    config.apiKey = previousApiKey
     globalThis.fetch = previousFetch
   })
 
@@ -117,7 +167,7 @@ test("API key authentication rejects missing and wrong keys with 401", async (t)
 
 test("normalizers apply the same content rules to every model", () => {
   // 开启思考（默认）：content 剥离 think 块，reasoning/reasoning_content 归一为 reasoning_content
-  const normalizer = __test.createOpenAIStreamNormalizer("custom-model")
+  const normalizer = createOpenAIStreamNormalizer("custom-model")
   const normalized = normalizer.normalize({
     choices: [
       {
@@ -137,7 +187,7 @@ test("normalizers apply the same content rules to every model", () => {
   assert.equal(normalized.choices[0].delta.reasoning, undefined)
 
   // 关闭思考：reasoning 系列字段全部删除，think 块剥离后丢弃
-  const disabled = __test.createOpenAIStreamNormalizer("custom-model", false)
+  const disabled = createOpenAIStreamNormalizer("custom-model", false)
   const stripped = disabled.normalize({
     choices: [
       {
@@ -153,7 +203,7 @@ test("normalizers apply the same content rules to every model", () => {
   assert.deepEqual(stripped.choices[0].delta, { content: "hi" })
 
   // reasoning_effort 原样透传（"none" 关闭思考，其余开启）
-  const request = __test.buildZenRequest(
+  const request = buildZenRequest(
     "custom-model",
     [{ role: "user", content: [{ type: "image_url", image_url: { url: "data:image/png;base64,abc" } }] }],
     true,
@@ -172,9 +222,9 @@ test("normalizers apply the same content rules to every model", () => {
 
 test("non-stream and stream requests share the same upstream business path", async (t) => {
   const previousFetch = globalThis.fetch
-  const previousApiKey = process.env.API_KEY
+  const previousApiKey = config.apiKey
   const calls = []
-  delete process.env.API_KEY
+  config.apiKey = undefined
   globalThis.fetch = async (url, init) => {
     calls.push({ url: String(url), init })
     return new Response(mockSSEBody(), {
@@ -187,7 +237,7 @@ test("non-stream and stream requests share the same upstream business path", asy
   t.after(() => {
     close(server)
     globalThis.fetch = previousFetch
-    restoreEnv("API_KEY", previousApiKey)
+    config.apiKey = previousApiKey
   })
 
   const basePayload = {
@@ -235,6 +285,77 @@ test("non-stream and stream requests share the same upstream business path", asy
   assert.equal(calls.length, 2)
 })
 
+test("request-level base URL validates and ignores query parameters", () => {
+  assert.equal(resolveBaseURL("https://mirror.example.com/"), "https://mirror.example.com")
+  assert.equal(resolveBaseURL("https://mirror.example.com/zen/v1"), "https://mirror.example.com/zen/v1")
+  assert.equal(
+    zenEndpoint("chat/completions", "https://mirror.example.com"),
+    "https://mirror.example.com/zen/v1/chat/completions",
+  )
+  assert.equal(zenEndpoint("models", "https://mirror.example.com/zen/v1"), "https://mirror.example.com/zen/v1/models")
+  assert.throws(() => resolveBaseURL("ftp://mirror.example.com"), /http/)
+  assert.equal(requestBaseURL(new Request("http://localhost/v1/models?base_url=https%3A%2F%2Fquery.example.com")), "")
+  assert.equal(
+    requestBaseURL(
+      new Request("http://localhost/v1/models", { headers: { "x-opencode-base-url": "https://header.example.com" } }),
+    ),
+    "https://header.example.com",
+  )
+})
+
+test("per-request base URL routes chat to header host and not query host", async (t) => {
+  const previousFetch = globalThis.fetch
+  const previousApiKey = config.apiKey
+  const calls = []
+  config.apiKey = undefined
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url: String(url), init })
+    return new Response(mockSSEBody(), { status: 200, headers: { "content-type": "text/event-stream" } })
+  }
+  const server = await listen(app)
+  t.after(() => {
+    close(server)
+    globalThis.fetch = previousFetch
+    config.apiKey = previousApiKey
+  })
+
+  const response = await request(server.url, {
+    method: "POST",
+    path: "/v1/chat/completions?base_url=https%3A%2F%2Fquery.example.com",
+    headers: { "content-type": "application/json", "x-opencode-base-url": "https://header.example.com" },
+    body: JSON.stringify({ model: "big-pickle", messages: [{ role: "user", content: "hi" }], stream: false }),
+  })
+  assert.equal(response.status, 200)
+  assert.equal(calls[0].url, "https://header.example.com/zen/v1/chat/completions")
+})
+
+test("per-request models use header host without polluting default cache", async (t) => {
+  const previousFetch = globalThis.fetch
+  const previousApiKey = config.apiKey
+  const calls = []
+  config.apiKey = "sk-test"
+  globalThis.fetch = async (url) => {
+    calls.push(String(url))
+    return new Response(JSON.stringify({ data: [{ id: "big-pickle" }] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })
+  }
+  const server = await listen(app)
+  t.after(() => {
+    close(server)
+    globalThis.fetch = previousFetch
+    config.apiKey = previousApiKey
+  })
+
+  const response = await request(server.url, {
+    path: "/v1/models",
+    headers: { authorization: "Bearer sk-test", "x-opencode-base-url": "https://mirror.example.com" },
+  })
+  assert.equal(response.status, 200)
+  assert.equal(calls[0], "https://mirror.example.com/zen/v1/models")
+})
+
 function mockSSEBody() {
   return [
     `data: ${JSON.stringify({ id: "chatcmpl-test", created: 1, choices: [{ index: 0, delta: { role: "assistant", content: "<thinking>hidden</thinking>hi", reasoning: "trace", reasoning_content: "legacy" } }] })}\n\n`,
@@ -278,90 +399,3 @@ function request(baseURL, { method = "GET", path = "/", headers = {}, body } = {
     outgoing.end()
   })
 }
-
-function restoreEnv(name, value) {
-  if (value === undefined) delete process.env[name]
-  else process.env[name] = value
-}
-
-test("resolveBaseURL falls back to env BASE_URL and default, validates scheme and host", () => {
-  const previousBaseUrl = process.env.BASE_URL
-  try {
-    delete process.env.BASE_URL
-    assert.equal(__test.resolveBaseURL(""), "https://opencode.ai")
-    assert.equal(__test.resolveBaseURL("https://mirror.example.com"), "https://mirror.example.com")
-    assert.equal(__test.resolveBaseURL("https://fake.resin.local/v1"), "https://fake.resin.local/v1")
-
-    process.env.BASE_URL = "https://deploy.example.com"
-    assert.equal(__test.resolveBaseURL(""), "https://deploy.example.com")
-    // 请求级 override 优先于部署级
-    assert.equal(__test.resolveBaseURL("https://req.example.net"), "https://req.example.net")
-
-    assert.throws(() => __test.resolveBaseURL("ftp://bad.example.com"), /must use http:\/\/ or https:\/\//)
-    assert.throws(() => __test.resolveBaseURL("not-a-url"), /must be a valid http:\/\/ or https:\/\/ URL/)
-  } finally {
-    restoreEnv("BASE_URL", previousBaseUrl)
-  }
-})
-
-test("requestBaseURL reads only the request header", () => {
-  const withHeader = new Request("http://localhost/v1/models", {
-    headers: { "x-opencode-base-url": "https://header.example.com" },
-  })
-  assert.equal(__test.requestBaseURL(withHeader), "https://header.example.com")
-
-  const withQuery = new Request("http://localhost/v1/models?base_url=https%3A%2F%2Fquery.example.com")
-  assert.equal(__test.requestBaseURL(withQuery), "")
-
-  assert.equal(__test.requestBaseURL(new Request("http://localhost/v1/models")), "")
-})
-
-test("zenEndpoint builds zen paths from base URL and avoids duplicate /zen/v1", () => {
-  assert.equal(__test.zenEndpoint("chat/completions", ""), "https://opencode.ai/zen/v1/chat/completions")
-  assert.equal(
-    __test.zenEndpoint("chat/completions", "https://mirror.example.com"),
-    "https://mirror.example.com/zen/v1/chat/completions",
-  )
-  assert.equal(
-    __test.zenEndpoint("models", "https://mirror.example.com/zen/v1"),
-    "https://mirror.example.com/zen/v1/models",
-  )
-})
-
-test("per-request upstream base URL routes the chat request to the override host", async (t) => {
-  const previousFetch = globalThis.fetch
-  const previousApiKey = process.env.API_KEY
-  const calls = []
-  delete process.env.API_KEY
-  globalThis.fetch = async (url, init) => {
-    calls.push({ url: String(url), init })
-    return new Response(mockSSEBody(), {
-      status: 200,
-      headers: { "content-type": "text/event-stream" },
-    })
-  }
-
-  const server = await listen(app)
-  t.after(() => {
-    close(server)
-    globalThis.fetch = previousFetch
-    restoreEnv("API_KEY", previousApiKey)
-  })
-
-  await request(server.url, {
-    method: "POST",
-    path: "/v1/chat/completions",
-    headers: {
-      "content-type": "application/json",
-      "x-opencode-base-url": "https://mirror.example.com",
-    },
-    body: JSON.stringify({
-      model: "big-pickle",
-      messages: [{ role: "user", content: "hi" }],
-      stream: true,
-    }),
-  })
-
-  assert.equal(calls.length, 1)
-  assert.equal(calls[0].url, "https://mirror.example.com/zen/v1/chat/completions")
-})
