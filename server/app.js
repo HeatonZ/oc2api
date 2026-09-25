@@ -1,7 +1,7 @@
 import express from "express"
 
 const OC_VERSION = "1.18.31"
-const PROXY_VERSION = "v2.0.0"
+const PROXY_VERSION = "v2.1.0"
 const DEFAULT_BASE_URL = "https://opencode.ai"
 const FETCH_TIMEOUT_MS = 5 * 60 * 1000
 
@@ -187,6 +187,7 @@ async function handleOpenAI(request) {
 
   const { model, messages, stream, tools, tool_choice, max_tokens, max_completion_tokens, temperature } = input.body
   const reasoningEffort = input.body.reasoning_effort ?? input.body.reasoningEffort
+  const thinkingEnabled = reasoningEffort !== "none"
   const maxTokens = max_tokens ?? max_completion_tokens
 
   const sessionId = getSession(auth.user)
@@ -195,6 +196,8 @@ async function handleOpenAI(request) {
     user: auth.user,
     model,
     mode: stream ? "stream" : "sync",
+    reasoningEffort,
+    thinkingEnabled,
     messages: messages?.length || 0,
   })
 
@@ -221,8 +224,8 @@ async function handleOpenAI(request) {
   }
 
   const response = stream
-    ? await openAIStreamResponse(upstream, requestId, model)
-    : await openAIFullStreamResponse(upstream, requestId, model)
+    ? await openAIStreamResponse(upstream, requestId, model, thinkingEnabled)
+    : await openAIFullStreamResponse(upstream, requestId, model, thinkingEnabled)
   response.headers.set("x-request-id", requestId)
   return response
 }
@@ -403,6 +406,8 @@ function buildZenRequest(
   if (!hadUserTools) reqBody.tool_choice = "none"
   else if (toolChoice != null) reqBody.tool_choice = toolChoice
 
+  // OpenAI 兼容：reasoning_effort 原样透传（"none" 关闭思考，low/medium/high 等开启），
+  // 不发明自定义字段，也不擅自改写取值。
   if (reasoningEffort != null && reasoningEffort !== "") {
     reqBody.reasoning_effort = reasoningEffort
   }
@@ -458,7 +463,7 @@ async function fetchZen(zenReq, requestId, model, stream, baseURL = "") {
   }
 }
 
-async function openAIFullStreamResponse(upstream, requestId, model) {
+async function openAIFullStreamResponse(upstream, requestId, model, thinkingEnabled) {
   const raw = await upstream.text()
   const zenError = parseZenError(raw)
   logUpstreamBody(requestId, model, upstream.status, raw, zenError)
@@ -472,7 +477,7 @@ async function openAIFullStreamResponse(upstream, requestId, model) {
     )
   }
 
-  const normalizer = createOpenAIStreamNormalizer(model)
+  const normalizer = createOpenAIStreamNormalizer(model, thinkingEnabled)
   const choices = new Map()
   let responseId = ""
   let created
@@ -501,6 +506,7 @@ async function openAIFullStreamResponse(upstream, requestId, model) {
           content: "",
           role: "",
           finish: "",
+          reasoning: "",
           toolCalls: new Map(),
         })
       }
@@ -508,6 +514,7 @@ async function openAIFullStreamResponse(upstream, requestId, model) {
       const delta = choice.delta && typeof choice.delta === "object" ? choice.delta : {}
       if (typeof delta.role === "string" && delta.role) state.role = delta.role
       if (typeof delta.content === "string") state.content += delta.content
+      if (typeof delta.reasoning_content === "string") state.reasoning += delta.reasoning_content
       if (Array.isArray(delta.tool_calls)) {
         for (const call of delta.tool_calls) {
           if (!call || typeof call !== "object") continue
@@ -535,6 +542,7 @@ async function openAIFullStreamResponse(upstream, requestId, model) {
         role: state.role || "assistant",
         content: state.content,
       }
+      if (state.reasoning) message.reasoning_content = state.reasoning
       if (state.toolCalls.size) {
         message.tool_calls = [...state.toolCalls.entries()]
           .sort(([a], [b]) => a - b)
@@ -562,7 +570,7 @@ async function openAIFullStreamResponse(upstream, requestId, model) {
   return jsonResponse(result, upstream.status)
 }
 
-async function openAIStreamResponse(upstream, requestId, model) {
+async function openAIStreamResponse(upstream, requestId, model, thinkingEnabled) {
   if (!upstream.body) {
     return openAIErrorResponse("Empty response from upstream", "upstream_error", 502)
   }
@@ -588,7 +596,7 @@ async function openAIStreamResponse(upstream, requestId, model) {
 
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
-  const normalizer = createOpenAIStreamNormalizer(model)
+  const normalizer = createOpenAIStreamNormalizer(model, thinkingEnabled)
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -657,7 +665,7 @@ async function openAIStreamResponse(upstream, requestId, model) {
   })
 }
 
-function createOpenAIStreamNormalizer(model) {
+function createOpenAIStreamNormalizer(model, thinkingEnabled) {
   const contentStates = new Map()
 
   return {
@@ -672,7 +680,9 @@ function createOpenAIStreamNormalizer(model) {
       const next = { ...chunk }
       delete next.cost
       if (model) next.model = model
-      next.choices = chunk.choices.map((choice) => normalizeOpenAIStreamChoice(choice, contentStates)).filter(Boolean)
+      next.choices = chunk.choices
+        .map((choice) => normalizeOpenAIStreamChoice(choice, contentStates, thinkingEnabled))
+        .filter(Boolean)
 
       if (!next.choices.length && !next.usage) return null
       return next
@@ -680,18 +690,35 @@ function createOpenAIStreamNormalizer(model) {
   }
 }
 
-function normalizeOpenAIStreamChoice(choice, contentStates) {
+function normalizeOpenAIStreamChoice(choice, contentStates, thinkingEnabled) {
   if (!choice?.delta) return choice
 
   const delta = { ...choice.delta }
-  delete delta.reasoning
-  delete delta.reasoning_content
+  const thinking = thinkingEnabled !== false
+  let strippedReasoning = ""
 
   if (typeof delta.content === "string") {
     const state = getThinkState(contentStates, choice.index ?? 0)
-    const visibleContent = stripThinkStreamText(delta.content, state)
+    const result = stripThinkStreamText(delta.content, state)
+    const visibleContent = result.content
+    strippedReasoning = result.reasoning
     if (visibleContent) delta.content = visibleContent
     else delete delta.content
+  }
+
+  if (thinking) {
+    // 开启思考：上游 reasoning / reasoning_content 统一归一为 OpenAI 兼容的
+    // reasoning_content，内容中被剥离的 think 块一并并入。
+    const fragments = []
+    if (typeof delta.reasoning === "string" && delta.reasoning) fragments.push(delta.reasoning)
+    if (typeof delta.reasoning_content === "string" && delta.reasoning_content) fragments.push(delta.reasoning_content)
+    delete delta.reasoning
+    if (strippedReasoning) fragments.push(strippedReasoning)
+    if (fragments.length) delta.reasoning_content = fragments.join("")
+  } else {
+    // 关闭思考：丢弃所有思考痕迹。
+    delete delta.reasoning
+    delete delta.reasoning_content
   }
 
   if (!Object.keys(delta).length && !choice.finish_reason) return null
@@ -699,9 +726,9 @@ function normalizeOpenAIStreamChoice(choice, contentStates) {
 }
 
 function stripThinkBlocks(text) {
-  if (!/<\/?think>/i.test(text)) return text
+  if (!/<\/?think(?:ing)?>/i.test(text) && !text.toLowerCase().includes(" thinking")) return text
   const state = createThinkState()
-  return stripThinkStreamText(text, state)
+  return stripThinkStreamText(text, state).content
 }
 
 function getThinkState(states, key) {
@@ -711,39 +738,81 @@ function getThinkState(states, key) {
 }
 
 function createThinkState() {
-  return { inThink: false, emittedContent: false, removedThink: false }
+  return { inThink: false, emittedContent: false, removedThink: false, reasoning: "" }
 }
 
 function stripThinkStreamText(text, state) {
   let output = ""
   let cursor = 0
-  const lower = text.toLowerCase()
 
   while (cursor < text.length) {
     if (state.inThink) {
-      const end = lower.indexOf("</think>", cursor)
-      if (end === -1) break
-      cursor = end + "</think>".length
+      const close = findThinkClose(text, cursor)
+      if (close.index === -1) {
+        // 思考块未闭合（流式中途截断）：剩余全部算思考
+        state.reasoning += text.slice(cursor)
+        break
+      }
+      state.reasoning += text.slice(cursor, close.index)
+      cursor = close.end
       state.inThink = false
       state.removedThink = true
       continue
     }
 
-    const start = lower.indexOf("<think>", cursor)
-    if (start === -1) {
+    const open = findThinkOpen(text, cursor)
+    if (open.index === -1) {
       output += text.slice(cursor)
       break
     }
 
-    output += text.slice(cursor, start)
-    cursor = start + "<think>".length
+    output += text.slice(cursor, open.index)
+    cursor = open.end
     state.inThink = true
     state.removedThink = true
   }
 
   if (state.removedThink && !state.emittedContent && output) output = output.replace(/^\s+/, "")
   if (output) state.emittedContent = true
-  return output
+  return { content: output, reasoning: state.reasoning }
+}
+
+function findThinkOpen(text, from) {
+  // 兼容 <thinking> 与 <think> 两种标签，以及 " thinking" 空格标记
+  const tag = text.indexOf("<thinking", from)
+  const short = tag === -1 ? text.indexOf("<think", from) : -1
+  const openIdx = tag !== -1 ? tag : short
+  if (openIdx !== -1) {
+    const word = tag !== -1 ? "<thinking" : "<think"
+    // 跳过标签名后的可选空白与 '>'
+    let end = openIdx + word.length
+    if (text[end] === ">") end += 1
+    return { index: openIdx, end }
+  }
+  const marker = text.indexOf(" thinking", from)
+  if (marker !== -1) {
+    return { index: marker, end: marker + " thinking".length }
+  }
+  return { index: -1, end: -1 }
+}
+
+function findThinkClose(text, from) {
+  // 兼容 </thinking> 与 </think> 两种标签，以及 " response" 空格标记
+  let tag = text.indexOf("</thinking", from)
+  let word = "</thinking"
+  if (tag === -1) {
+    tag = text.indexOf("</think", from)
+    word = "</think"
+  }
+  if (tag !== -1) {
+    const after = text.indexOf(">", tag)
+    return { index: tag, end: after === -1 ? tag + word.length : after + 1 }
+  }
+  const marker = text.indexOf(" response", from)
+  if (marker !== -1) {
+    return { index: marker, end: marker + " response".length }
+  }
+  return { index: -1, end: -1 }
 }
 
 function debugLog(label, payload) {
