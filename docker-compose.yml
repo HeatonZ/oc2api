@@ -10,4 +10,6 @@ services:
       API_KEY: "${API_KEY:-}"
       DEBUG: "${DEBUG:-false}"
       BASE_URL: "${BASE_URL:-}"
+      ZEN_API_BASE_URL: "${ZEN_API_BASE_URL:-}"
+      ZEN_CONNECT_TIMEOUT_MS: "${ZEN_CONNECT_TIMEOUT_MS:-60000}"
     restart: always

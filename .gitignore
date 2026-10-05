@@ -1,5 +1,7 @@
 .vercel/
 node_modules/
+*.tar.gz
+*.sh
 .idea/
 .env
 .env.*
@@ -8,3 +10,5 @@ oc2api
 *.log
 .DS_Store
 coverage/
+.vercel
+.env*
