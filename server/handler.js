@@ -5,10 +5,10 @@ import { debugLog, logZenRequest } from "./log.js"
 import {
   buildUpstreamRequest,
   fetchUpstream,
-  getSession,
   isAllowedModelId,
   listModels,
   requestBaseURL,
+  resolveSession,
   zenEndpoint,
 } from "./zen.js"
 import { respondJson, respondStream } from "./openai.js"
@@ -105,7 +105,10 @@ export async function chat(request, response) {
     messages: input.messages.length,
   })
 
-  const sessionId = getSession(request.auth.user)
+  // 会话标识按调用方透传的稳定标识派生，全部缺失时才退回按 user 缓存。
+  // 修复前这里恒为 getSession(request.auth.user)，而 API_KEY 为空时 user 恒为
+  // anonymous，导致所有账号、所有会话共用同一个 x-opencode-session。
+  const sessionId = resolveSession(request, input, request.auth.user)
   const upstreamRequest = buildUpstreamRequest(input, sessionId)
   upstreamRequest.url = zenEndpoint("chat/completions", baseURL)
   logZenRequest(requestId, "openai", input.model, stream, request.auth.user, upstreamRequest, input.messages.length)

@@ -1,9 +1,16 @@
 // OpenCode Zen 上游客户端。免费层的硬门槛（均对真实上游逐项验证过）：
 //   1. User-Agent 必须形如 opencode/<version>，其他一律 403；
-//   2. 必须带 x-opencode-session（ses_ + 26 位小写十六进制）；
+//   2. 必须带 x-opencode-session（ses_ + 26 位小写十六进制），格式不符一律 403；
 //   3. 请求体必须含 bash / read 两个"门禁工具"，缺失即 403；
 //   4. stream 必须为 true，stream:false 一律 403。
 // 除此之外上游就是标准 OpenAI 协议，本模块只补齐上述条件，业务字段原样透传。
+//
+// 第 2 条按调用方会话动态取值：入站 x-opencode-session / x-hermes-session-id
+// 优先，其次 body 的 prompt_cache_key / metadata.user_id，再次由 system 提示与
+// 首条 user 消息内容派生。任何种子都先归一化成上游要求的 ses_<26 位小写 hex>
+// 再发出——不做归一化直接透传 UUID 之类格式会被上游 403。
+import { createHash } from "node:crypto"
+
 import { ocId } from "./shared.js"
 import { debugLog } from "./log.js"
 
@@ -199,9 +206,88 @@ async function fetchZenModels(baseURL = "") {
   }
 }
 
+// 上游只接受 ses_ + 26 位小写十六进制；UUID、25 位、大写 hex 一律 403（逐项实测）。
+const SESSION_ID_PATTERN = /^ses_[0-9a-f]{26}$/
+
+// 入站会话标识的读取顺序：显式请求头 → OpenAI 标准 body 字段 → 内容派生。
+// 只要调用方（或链路上任意一跳）透传了稳定标识就按会话隔离；全部缺失时退回内容
+// 派生，避免所有调用方共用一个 session。
+const SESSION_HEADER_NAMES = ["x-opencode-session", "x-hermes-session-id"]
+
+// 把任意稳定种子归一化成上游要求的 ses_<26 位小写 hex>。
+export function deriveSessionId(seed) {
+  const value = String(seed ?? "").trim()
+  if (!value) return ""
+  if (SESSION_ID_PATTERN.test(value)) return value
+  const digest = createHash("sha256").update(value).digest("hex")
+  return `ses_${digest.slice(0, 26)}`
+}
+
+export function inboundSessionSeed(request, payload) {
+  for (const name of SESSION_HEADER_NAMES) {
+    const value = readHeader(request, name)
+    if (value) return value
+  }
+  if (!payload || typeof payload !== "object") return ""
+  const fromBody = payloadSessionSeed(payload)
+  if (fromBody) return fromBody
+  return contentSessionSeed(payload.messages)
+}
+
+function readHeader(request, name) {
+  const headers = request?.headers
+  if (typeof headers?.get === "function") return String(headers.get(name) || "").trim()
+  return String(headers?.[name] || "").trim()
+}
+
+// OpenAI 标准会话字段：Chat Completions 的 prompt_cache_key，
+// Anthropic 的 metadata.user_id。两者在本生态里都被当作会话标识
+// （Sub2API 的 openCodeSessionIDFromPayload 同源读取）。业务字段原样透传，这里只读不写。
+//
+// 刻意不读顶层的 user 字段：它是"每个终端用户"而不是"每个会话"，
+// 拿它当 session 会让同一用户的所有会话共用同一个上游 session，
+// 正是需要避免的跨会话提示词缓存串味。
+function payloadSessionSeed(payload) {
+  for (const value of [payload.prompt_cache_key, payload.metadata?.user_id]) {
+    const seed = String(value ?? "").trim()
+    if (seed) return seed
+  }
+  return ""
+}
+
+// 内容派生：同一会话的 system 提示与首条 user 消息稳定不变，不同会话首条 user 不同。
+function contentSessionSeed(messages) {
+  if (!Array.isArray(messages) || !messages.length) return ""
+  const systemParts = []
+  let firstUser = ""
+  for (const message of messages) {
+    const role = message?.role
+    if (role === "system" || role === "developer") systemParts.push(stringifyContent(message?.content))
+    else if (!firstUser && role === "user") firstUser = stringifyContent(message?.content)
+  }
+  const seed = `${systemParts.join("\u0000")}\u0001${firstUser}`
+  return seed.trim().length > 1 ? seed : ""
+}
+
+function stringifyContent(content) {
+  if (typeof content === "string") return content
+  if (content == null) return ""
+  try {
+    return JSON.stringify(content)
+  } catch {
+    return String(content)
+  }
+}
+
 // 上游按 x-opencode-session 归并会话；同一使用者复用同一个 session 直到过期。
 const SESSION_TTL_MS = 30 * 60 * 1000
 const userSessions = new Map()
+
+export function resolveSession(request, payload, user) {
+  const seed = inboundSessionSeed(request, payload)
+  if (seed) return deriveSessionId(seed)
+  return getSession(user)
+}
 
 export function getSession(user) {
   const now = Date.now()

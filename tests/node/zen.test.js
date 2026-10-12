@@ -1,7 +1,15 @@
 import assert from "node:assert/strict"
 import test from "node:test"
 
-import { buildUpstreamRequest, gateTool, isAllowedModelId, getSession } from "../../server/zen.js"
+import {
+  buildUpstreamRequest,
+  deriveSessionId,
+  gateTool,
+  getSession,
+  inboundSessionSeed,
+  isAllowedModelId,
+  resolveSession,
+} from "../../server/zen.js"
 
 test("免费层必要条件：UA、session、门禁工具、强制流式", () => {
   const request = buildUpstreamRequest({ model: "big-pickle", messages: [{ role: "user", content: "hi" }] }, "ses_test")
@@ -110,6 +118,79 @@ test("session 符合上游格式且同一使用者复用直到过期", () => {
   assert.match(first, /^ses_[0-9a-f]{26}$/)
   assert.equal(getSession(user), first, "同一使用者应复用 session")
   assert.notEqual(getSession("user-b"), first)
+})
+
+test("deriveSessionId 把任意种子归一化成上游要求的 ses_<26 位小写 hex>", () => {
+  // 上游只接受 ses_ + 恰好 26 位小写 hex；UUID / 25 位 / 大写 hex 均被 403（实测）。
+  assert.match(deriveSessionId("gwk_2ca5cd69b10b15e3b0bcbb76"), /^ses_[0-9a-f]{26}$/)
+  assert.match(deriveSessionId("550e8400-e29b-41d4-a716-446655440000"), /^ses_[0-9a-f]{26}$/)
+  assert.match(deriveSessionId("任意中文会话标识"), /^ses_[0-9a-f]{26}$/)
+  assert.equal(deriveSessionId(""), "")
+  assert.equal(deriveSessionId(null), "")
+  // 已合规的值原样保留，不做二次哈希（避免上游缓存桶漂移）。
+  assert.equal(deriveSessionId("ses_0123456789abcdef0123456789"), "ses_0123456789abcdef0123456789")
+  // 稳定：同种子同值；隔离：不同种子不同值。
+  assert.equal(deriveSessionId("conv-a"), deriveSessionId("conv-a"))
+  assert.notEqual(deriveSessionId("conv-a"), deriveSessionId("conv-b"))
+})
+
+test("inboundSessionSeed 优先级：请求头 → body 字段 → 内容派生", () => {
+  const headers = new Map([["x-opencode-session", "ses_from_header_00000000000000"]])
+  const request = { headers: { get: (k) => headers.get(k) } }
+  const payload = { prompt_cache_key: "pck-from-body", messages: [{ role: "user", content: "hi" }] }
+  assert.equal(inboundSessionSeed(request, payload), "ses_from_header_00000000000000")
+
+  // 无头时读 body 的 prompt_cache_key。
+  assert.equal(inboundSessionSeed({}, payload), "pck-from-body")
+  // metadata.user_id（Anthropic 风格）次之。
+  assert.equal(inboundSessionSeed({}, { metadata: { user_id: "meta-user" } }), "meta-user")
+  // 都没有时按内容派生。
+  const seed = inboundSessionSeed({}, { messages: [{ role: "user", content: "unique-first-turn" }] })
+  assert.match(seed, /unique-first-turn/)
+
+  // 顶层 user 不参与：它是"每个用户"而不是"每个会话"。
+  const onlyUser = { user: "terminal-user-1", messages: [{ role: "user", content: "x" }] }
+  assert.equal(payloadSessionSeedIsNotUser(onlyUser), true)
+})
+
+function payloadSessionSeedIsNotUser(payload) {
+  // 同一 user 的两条不同会话必须得到不同 seed。
+  const a = inboundSessionSeed({}, { ...payload, messages: [{ role: "user", content: "turn-A" }] })
+  const b = inboundSessionSeed({}, { ...payload, messages: [{ role: "user", content: "turn-B" }] })
+  return a !== b && a !== "terminal-user-1" && b !== "terminal-user-1"
+}
+
+test("resolveSession：有入站标识按会话隔离，无标识才退回按 user 缓存", () => {
+  const payload = {
+    messages: [
+      { role: "system", content: "sys" },
+      { role: "user", content: "first" },
+    ],
+  }
+  const headers = new Map([["x-hermes-session-id", "gwk_2ca5cd69b10b15e3b0bcbb76"]])
+  const withHeader = resolveSession({ headers: { get: (k) => headers.get(k) } }, payload, "anonymous")
+  assert.match(withHeader, /^ses_[0-9a-f]{26}$/)
+  // 同一会话跨轮稳定。
+  assert.equal(resolveSession({ headers: { get: (k) => headers.get(k) } }, payload, "anonymous"), withHeader)
+
+  // 不同会话必须不同（这正是修复前的缺陷：全部共用一个 session）。
+  const other = {
+    messages: [
+      { role: "system", content: "sys" },
+      { role: "user", content: "different" },
+    ],
+  }
+  assert.notEqual(resolveSession({}, other, "anonymous"), resolveSession({}, payload, "anonymous"))
+
+  // 完全无信号时退回按 user 缓存，保持旧行为可用。
+  assert.match(resolveSession({}, { messages: [] }, "anonymous"), /^ses_[0-9a-f]{26}$/)
+})
+
+test("buildUpstreamRequest 发出的 session 始终符合上游格式", () => {
+  for (const seed of ["gwk_abc", "550e8400-e29b-41d4-a716-446655440000", "中文", "ses_0123456789abcdef0123456789"]) {
+    const request = buildUpstreamRequest({ model: "big-pickle", messages: [] }, deriveSessionId(seed))
+    assert.match(request.headers["x-opencode-session"], /^ses_[0-9a-f]{26}$/)
+  }
 })
 
 test("门禁工具定义带有禁止调用提示（不把描述当成强制保证）", () => {
