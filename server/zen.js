@@ -223,19 +223,25 @@ const SESSION_COUNTER = 1n
 const SESSION_COUNTER_MAX = 32n
 
 // 生成上游认可的规范 session：前 12 位是倒置时间戳，后 14 位是 base62 随机数。
-// counter 固定取 1（上游接受区间实测为 0~32，见 SESSION_COUNTER_MAX）。
-export function canonicalSessionId(timestamp = Date.now()) {
-  const current = BigInt(timestamp) * 0x1000n + SESSION_COUNTER
-  const inverted = ~current & 0xffffffffffffn
-  const prefix = Array.from({ length: 6 }, (_, index) =>
-    Number((inverted >> BigInt(40 - 8 * index)) & 0xffn)
+// 算法与上游 v2.5.0 的 sessionId() 一致（counter 固定 1，落在实测接受区间 0~32 内）。
+// 上游 v2.5.0 已把该生成器命名为 sessionId()，这里沿用其命名以免后续同步再冲突；
+// canonicalSessionId 仅作为 fork 侧的别名保留。
+export function sessionId(timestamp = Date.now()) {
+  // 与上游 descending() 一致：value = ~(timestamp * 0x1000 + counter) 取低 48 位十六进制。
+  const value = ~(BigInt(timestamp) * 0x1000n + SESSION_COUNTER)
+  let time = ""
+  for (let index = 0; index < 6; index += 1) {
+    time += Number((value >> BigInt(40 - 8 * index)) & 0xffn)
       .toString(16)
-      .padStart(2, "0"),
-  ).join("")
+      .padStart(2, "0")
+  }
   const bytes = new Uint8Array(14)
   crypto.getRandomValues(bytes)
-  const suffix = [...bytes].map((byte) => BASE62_CHARS[byte % 62]).join("")
-  return `ses_${prefix}${suffix}`
+  return "ses_" + time + [...bytes].map((byte) => BASE62_CHARS[byte % 62]).join("")
+}
+
+export function canonicalSessionId(timestamp = Date.now()) {
+  return sessionId(timestamp)
 }
 
 // 反解前 12 位 hex 里的 counter（低 12 位）。上游校验的就是这个值。
@@ -352,7 +358,7 @@ function stringifyContent(content) {
 }
 
 // 无任何入站标识时的兜底：按使用者缓存一个规范 session，避免所有人共用一个。
-// 这里同样必须用 canonicalSessionId —— 随机 hex 会被上游判为伪造客户端并 403。
+// 这里同样必须用 sessionId() —— 随机 hex 会被上游判为伪造客户端并 403。
 const userSessions = new Map()
 
 export function resolveSession(request, payload, user) {
@@ -368,7 +374,7 @@ export function getSession(user) {
     existing.at = now
     return existing.id
   }
-  const id = canonicalSessionId(now)
+  const id = sessionId(now)
   userSessions.set(user, { id, at: now })
   return id
 }

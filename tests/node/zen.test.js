@@ -116,7 +116,9 @@ test("模型白名单只放行 big-pickle 与 -free 结尾", () => {
 test("session 符合上游格式且同一使用者复用直到过期", () => {
   const user = "user-a"
   const first = getSession(user)
+  // 上游只认这种形状：ses_ + 12 位十六进制 + 14 位 base62，共 30 字符
   assert.match(first, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+  assert.equal(first.length, 30)
   assert.equal(getSession(user), first, "同一使用者应复用 session")
   assert.notEqual(getSession("user-b"), first)
 })
