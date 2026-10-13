@@ -3,6 +3,7 @@ import test from "node:test"
 
 import {
   buildUpstreamRequest,
+  canonicalSessionId,
   deriveSessionId,
   gateTool,
   getSession,
@@ -115,21 +116,56 @@ test("模型白名单只放行 big-pickle 与 -free 结尾", () => {
 test("session 符合上游格式且同一使用者复用直到过期", () => {
   const user = "user-a"
   const first = getSession(user)
-  assert.match(first, /^ses_[0-9a-f]{26}$/)
+  assert.match(first, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
   assert.equal(getSession(user), first, "同一使用者应复用 session")
   assert.notEqual(getSession("user-b"), first)
 })
 
-test("deriveSessionId 把任意种子归一化成上游要求的 ses_<26 位小写 hex>", () => {
-  // 上游只接受 ses_ + 恰好 26 位小写 hex；UUID / 25 位 / 大写 hex 均被 403（实测）。
-  assert.match(deriveSessionId("gwk_2ca5cd69b10b15e3b0bcbb76"), /^ses_[0-9a-f]{26}$/)
-  assert.match(deriveSessionId("550e8400-e29b-41d4-a716-446655440000"), /^ses_[0-9a-f]{26}$/)
-  assert.match(deriveSessionId("任意中文会话标识"), /^ses_[0-9a-f]{26}$/)
+// 上游解析前 12 位 hex 为 ~(BigInt(Date.now()) * 4096n + counter) 截断到 48 位，
+// 并校验其中的 counter（低 12 位）落在接受区间内；高 36 位（时间戳）实测不被校验。
+// 随机 hex / sha256 摘要的低 12 位是任意值，绝大多数落在区间外，于是被判为非
+// OpenCode 客户端并回 403 FreeTierError。实测对照：规范前缀 200，随机 hex 与
+// sha256 派生 403；counter 0~32 通过、64 起 403。这里按上游算法反解 counter 校验。
+const MASK48 = (1n << 48n) - 1n
+const MAX_ACCEPTED_COUNTER = 32n
+
+function decodeCounter(sessionId) {
+  const value = BigInt(`0x${sessionId.slice(4, 16)}`)
+  return ~value & MASK48 & 0xfffn
+}
+
+test("session 前缀编码的是上游认可的倒置时间戳", () => {
+  const before = BigInt(Date.now())
+  const id = canonicalSessionId()
+  assert.match(id, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/, "必须是 ses_ + 12 位 hex + 14 位 base62")
+  const after = BigInt(Date.now())
+  // 高 36 位是时间戳：可反解回当前时间（按 2^36 取模）。
+  const decoded = ((~BigInt(`0x${id.slice(4, 16)}`) & MASK48) >> 12n) + (before & ~((1n << 36n) - 1n))
+  assert.ok(
+    decoded >= before - 4096n && decoded <= after + 4096n,
+    `前缀高 36 位应解码为当前毫秒时间戳，实际 ${decoded}（期望 ${before}~${after}）`,
+  )
+  // 低 12 位是 counter，必须落在上游接受的区间内——这是通过校验的关键。
+  const counter = decodeCounter(id)
+  assert.ok(counter <= MAX_ACCEPTED_COUNTER, `counter 必须 <= ${MAX_ACCEPTED_COUNTER}，实际 ${counter}`)
+})
+
+test("deriveSessionId 把任意种子归一化成上游认可的 session", () => {
+  // 必须同时满足：格式正确 + 前缀编码了倒置时间戳。随机 hex 会被上游 403（实测）。
+  for (const seed of ["gwk_2ca5cd69b10b15e3b0bcbb76", "550e8400-e29b-41d4-a716-446655440000", "任意中文会话标识"]) {
+    const id = deriveSessionId(seed)
+    assert.match(id, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    assert.ok(decodeCounter(id) <= MAX_ACCEPTED_COUNTER, "前缀 counter 必须落在上游接受区间内")
+  }
   assert.equal(deriveSessionId(""), "")
   assert.equal(deriveSessionId(null), "")
-  // 已合规的值原样保留，不做二次哈希（避免上游缓存桶漂移）。
-  assert.equal(deriveSessionId("ses_0123456789abcdef0123456789"), "ses_0123456789abcdef0123456789")
-  // 稳定：同种子同值；隔离：不同种子不同值。
+  // 已合规（格式 + counter 都在上游接受区间内）的值原样保留，不做二次哈希。
+  const canonical = "ses_ecc41b777ffe" + "a".repeat(14)
+  assert.equal(deriveSessionId(canonical), canonical)
+  // 格式对但 counter 落在区间外（0x654 > 32）的值不能透传，必须重新生成。
+  assert.notEqual(deriveSessionId("ses_0123456789abcdef0123456789"), "ses_0123456789abcdef0123456789")
+  assert.ok(decodeCounter(deriveSessionId("ses_0123456789abcdef0123456789")) <= MAX_ACCEPTED_COUNTER)
+  // 稳定：同种子复用同一 session（保证上游提示词缓存亲和）；隔离：不同种子不同值。
   assert.equal(deriveSessionId("conv-a"), deriveSessionId("conv-a"))
   assert.notEqual(deriveSessionId("conv-a"), deriveSessionId("conv-b"))
 })
@@ -169,7 +205,7 @@ test("resolveSession：有入站标识按会话隔离，无标识才退回按 us
   }
   const headers = new Map([["x-hermes-session-id", "gwk_2ca5cd69b10b15e3b0bcbb76"]])
   const withHeader = resolveSession({ headers: { get: (k) => headers.get(k) } }, payload, "anonymous")
-  assert.match(withHeader, /^ses_[0-9a-f]{26}$/)
+  assert.match(withHeader, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
   // 同一会话跨轮稳定。
   assert.equal(resolveSession({ headers: { get: (k) => headers.get(k) } }, payload, "anonymous"), withHeader)
 
@@ -183,13 +219,16 @@ test("resolveSession：有入站标识按会话隔离，无标识才退回按 us
   assert.notEqual(resolveSession({}, other, "anonymous"), resolveSession({}, payload, "anonymous"))
 
   // 完全无信号时退回按 user 缓存，保持旧行为可用。
-  assert.match(resolveSession({}, { messages: [] }, "anonymous"), /^ses_[0-9a-f]{26}$/)
+  assert.match(resolveSession({}, { messages: [] }, "anonymous"), /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
 })
 
 test("buildUpstreamRequest 发出的 session 始终符合上游格式", () => {
   for (const seed of ["gwk_abc", "550e8400-e29b-41d4-a716-446655440000", "中文", "ses_0123456789abcdef0123456789"]) {
     const request = buildUpstreamRequest({ model: "big-pickle", messages: [] }, deriveSessionId(seed))
-    assert.match(request.headers["x-opencode-session"], /^ses_[0-9a-f]{26}$/)
+    const session = request.headers["x-opencode-session"]
+    assert.match(session, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/)
+    // 前缀必须编码出上游接受区间内的 counter，否则按伪造客户端 403（实测）。
+    assert.ok(decodeCounter(session) <= MAX_ACCEPTED_COUNTER)
   }
 })
 

@@ -1,16 +1,16 @@
 // OpenCode Zen 上游客户端。免费层的硬门槛（均对真实上游逐项验证过）：
 //   1. User-Agent 必须形如 opencode/<version>，其他一律 403；
-//   2. 必须带 x-opencode-session（ses_ + 26 位小写十六进制），格式不符一律 403；
+//   2. 必须带 x-opencode-session，且其前 12 位 hex 必须是「倒置毫秒时间戳」
+//      ~(BigInt(Date.now()) * 4096n + counter)；格式不符或前缀是随机值一律 403；
 //   3. 请求体必须含 bash / read 两个"门禁工具"，缺失即 403；
 //   4. stream 必须为 true，stream:false 一律 403。
 // 除此之外上游就是标准 OpenAI 协议，本模块只补齐上述条件，业务字段原样透传。
 //
 // 第 2 条按调用方会话动态取值：入站 x-opencode-session / x-hermes-session-id
 // 优先，其次 body 的 prompt_cache_key / metadata.user_id，再次由 system 提示与
-// 首条 user 消息内容派生。任何种子都先归一化成上游要求的 ses_<26 位小写 hex>
-// 再发出——不做归一化直接透传 UUID 之类格式会被上游 403。
-import { createHash } from "node:crypto"
-
+// 首条 user 消息内容派生。任何种子都先归一化成上游认可的
+// ses_<12 位倒置时间戳><14 位 base62> 再发出——不做归一化直接透传 UUID 会被 403，
+// 而用随机 hex / sha256 摘要充当前缀同样会被判为伪造客户端（见 canonicalSessionId）。
 import { ocId } from "./shared.js"
 import { debugLog } from "./log.js"
 
@@ -206,21 +206,93 @@ async function fetchZenModels(baseURL = "") {
   }
 }
 
-// 上游只接受 ses_ + 26 位小写十六进制；UUID、25 位、大写 hex 一律 403（逐项实测）。
-const SESSION_ID_PATTERN = /^ses_[0-9a-f]{26}$/
+// 上游对 x-opencode-session 的校验（逐项对照实测得出）：
+//   格式：ses_ + 12 位小写 hex + 14 位 base62 字符；UUID、25 位、大写 hex 一律 403。
+//   语义：前 12 位 hex 按 ~(BigInt(Date.now()) * 4096n + counter) 截断到 48 位解读，
+//         其中低 12 位的 counter 必须落在接受区间内（实测 0~32 通过、64 起 403）。
+//         高 36 位（时间戳）实测不被校验，但按官方格式写才安全。
+// 随机 hex / sha256 摘要的 counter 是任意值，绝大多数落在区间外，于是被判为非
+// OpenCode 客户端并回 403 FreeTierError
+// （原文 "OpenCode's free tier can only be used from within OpenCode"）。
+const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+const SESSION_ID_PATTERN = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/
+
+// 前缀低 12 位编码的 counter。上游只接受 0~32（实测：32 通过、64 起 403），
+// 我们固定生成 1。
+const SESSION_COUNTER = 1n
+const SESSION_COUNTER_MAX = 32n
+
+// 生成上游认可的规范 session：前 12 位是倒置时间戳，后 14 位是 base62 随机数。
+// counter 固定取 1（上游接受区间实测为 0~32，见 SESSION_COUNTER_MAX）。
+export function canonicalSessionId(timestamp = Date.now()) {
+  const current = BigInt(timestamp) * 0x1000n + SESSION_COUNTER
+  const inverted = ~current & 0xffffffffffffn
+  const prefix = Array.from({ length: 6 }, (_, index) =>
+    Number((inverted >> BigInt(40 - 8 * index)) & 0xffn)
+      .toString(16)
+      .padStart(2, "0"),
+  ).join("")
+  const bytes = new Uint8Array(14)
+  crypto.getRandomValues(bytes)
+  const suffix = [...bytes].map((byte) => BASE62_CHARS[byte % 62]).join("")
+  return `ses_${prefix}${suffix}`
+}
+
+// 反解前 12 位 hex 里的 counter（低 12 位）。上游校验的就是这个值。
+function sessionCounter(sessionId) {
+  const value = BigInt(`0x${sessionId.slice(4, 16)}`)
+  return ~value & 0xffffffffffffn & 0xfffn
+}
+
+// 格式对还不够：counter 必须在接受区间内，否则上游同样按伪造客户端 403。
+// 所以「透传入站值」的条件是格式与 counter 双合规，否则一律重新生成。
+function isUpstreamAcceptedSession(value) {
+  return SESSION_ID_PATTERN.test(value) && sessionCounter(value) <= SESSION_COUNTER_MAX
+}
 
 // 入站会话标识的读取顺序：显式请求头 → OpenAI 标准 body 字段 → 内容派生。
 // 只要调用方（或链路上任意一跳）透传了稳定标识就按会话隔离；全部缺失时退回内容
 // 派生，避免所有调用方共用一个 session。
 const SESSION_HEADER_NAMES = ["x-opencode-session", "x-hermes-session-id"]
 
-// 把任意稳定种子归一化成上游要求的 ses_<26 位小写 hex>。
+// 种子 → 规范 session 的映射。同一会话复用同一个 session，保证上游的提示词缓存
+// 亲和稳定；种子不同则不复用。TTL 取 30 分钟，与原来的按 user 缓存一致。
+// 实测上游对时间戳新鲜度很宽松（30 天前与 1 天后的前缀都能通过），因此缓存复用
+// 生成的 session 不会因为"变旧"而失效。
+const SESSION_TTL_MS = 30 * 60 * 1000
+const MAX_SESSION_ENTRIES = 5000
+const seedSessions = new Map()
+
+function pruneSeedSessions(now) {
+  for (const [key, entry] of seedSessions) {
+    if (now - entry.at >= SESSION_TTL_MS) seedSessions.delete(key)
+    else break
+  }
+  while (seedSessions.size > MAX_SESSION_ENTRIES) {
+    seedSessions.delete(seedSessions.keys().next().value)
+  }
+}
+
+// 把任意稳定种子归一化成上游认可的 ses_<12 位倒置时间戳><14 位 base62>。
 export function deriveSessionId(seed) {
   const value = String(seed ?? "").trim()
   if (!value) return ""
-  if (SESSION_ID_PATTERN.test(value)) return value
-  const digest = createHash("sha256").update(value).digest("hex")
-  return `ses_${digest.slice(0, 26)}`
+  // 已经是上游认可的格式且 counter 合法才直接透传；格式对但 counter 非法也会 403，
+  // 必须重新生成规范值。
+  if (isUpstreamAcceptedSession(value)) return value
+  const now = Date.now()
+  const existing = seedSessions.get(value)
+  if (existing && now - existing.at < SESSION_TTL_MS) {
+    existing.at = now
+    // 重新插入到末尾，让 Map 的迭代顺序即最近使用顺序。
+    seedSessions.delete(value)
+    seedSessions.set(value, existing)
+    return existing.id
+  }
+  const id = canonicalSessionId(now)
+  seedSessions.set(value, { id, at: now })
+  pruneSeedSessions(now)
+  return id
 }
 
 export function inboundSessionSeed(request, payload) {
@@ -279,8 +351,8 @@ function stringifyContent(content) {
   }
 }
 
-// 上游按 x-opencode-session 归并会话；同一使用者复用同一个 session 直到过期。
-const SESSION_TTL_MS = 30 * 60 * 1000
+// 无任何入站标识时的兜底：按使用者缓存一个规范 session，避免所有人共用一个。
+// 这里同样必须用 canonicalSessionId —— 随机 hex 会被上游判为伪造客户端并 403。
 const userSessions = new Map()
 
 export function resolveSession(request, payload, user) {
@@ -296,9 +368,7 @@ export function getSession(user) {
     existing.at = now
     return existing.id
   }
-  const bytes = new Uint8Array(13)
-  crypto.getRandomValues(bytes)
-  const id = "ses_" + [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("")
+  const id = canonicalSessionId(now)
   userSessions.set(user, { id, at: now })
   return id
 }

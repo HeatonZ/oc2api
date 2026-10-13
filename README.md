@@ -148,3 +148,14 @@ Authorization: Bearer <api-key>
 以上限制数据来源于接口 [https://models.opencode.ai/api.json](https://models.opencode.ai/api.json)（`opencode` key 下对应模型的 `limit` 字段），可自行查看核实，以实际使用为准。
 
 聊天上游返回 HTTP 错误或流解析失败时，在下游响应头尚未发送前归一为 `429`，便于账号池切换；流式头已发送后只能返回 SSE 错误事件，且不补 `[DONE]`。建连网络失败、建连超时及模型列表错误仍沿用原有的 `502` / `504` 分类。
+
+## 免费层会话标识（x-opencode-session）
+
+OpenCode Zen 免费层会校验 `x-opencode-session`，**格式与语义都要对**，否则一律 `403 FreeTierError`（原文 `OpenCode's free tier can only be used from within OpenCode`）：
+
+- **格式**：`ses_` + 12 位小写 hex + 14 位 base62 字符。UUID、25 位、大写 hex 都会被拒。
+- **语义**：前 12 位 hex 按 `~(BigInt(Date.now()) * 4096n + counter)` 截断到 48 位解读，其中低 12 位的 `counter` 必须落在接受区间内（实测 `0~32` 通过、`64` 起被拒）。**光格式对不够**——随机 hex 或 sha256 摘要的低 12 位是任意值，绝大多数落在区间外，会被判为「非 OpenCode 客户端」而拒。
+
+因此本代理对入站会话标识做归一化：`x-opencode-session` / `x-hermes-session-id` → body 的 `prompt_cache_key` / `metadata.user_id` → `system` + 首条 `user` 内容派生，逐级取种子；已经是合法 `ses_` 值（且 counter 合规）才原样透传，否则重新生成规范值。同一会话复用同一个 session 以保持上游提示词缓存亲和，TTL 30 分钟。
+
+请求级上游地址由 `X-OpenCode-Base-URL` 请求头决定（优先于 `BASE_URL` 环境变量与默认地址），供多账号各自指向独立上游入口使用。
