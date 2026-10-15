@@ -2,6 +2,7 @@ import assert from "node:assert/strict"
 import test from "node:test"
 
 import {
+  areToolsDisabled,
   buildUpstreamRequest,
   canonicalSessionId,
   deriveSessionId,
@@ -18,13 +19,18 @@ test("免费层必要条件：UA、session、门禁工具、强制流式", () =>
 
   assert.equal(body.stream, true, "stream:false 会被上游 403，必须强制 true")
   assert.deepEqual(body.stream_options, { include_usage: true })
-  assert.match(request.headers["User-Agent"], /^opencode\//)
+  assert.equal(request.headers["User-Agent"], "opencode/latest/2.0.29/cli")
   assert.equal(request.headers.Authorization, "Bearer public")
-  assert.equal(request.headers["x-opencode-session"], "ses_test")
+  assert.equal(request.headers["x-opencode-client"], "cli")
+  assert.equal(request.headers["x-opencode-project"], "global")
+  assert.equal(request.headers["x-opencode-request"], undefined, "V2 不发送旧版非标准 request ID，会导致 403")
+  for (const header of ["x-opencode-session", "x-opencode-session-id", "x-session-affinity", "X-Session-Id"]) {
+    assert.equal(request.headers[header], "ses_test", `${header} 必须复用同一会话`)
+  }
 
   const names = body.tools.map((tool) => tool.function.name)
-  assert.ok(names.includes("bash") && names.includes("read"), "缺少 bash/read 会 403")
-  assert.equal(body.tool_choice, "none", "无用户工具时必须禁止选中门禁工具")
+  assert.deepEqual(names, ["shell", "read"], "V2 使用 shell/read 而不是 bash/read")
+  assert.equal(body.tool_choice, undefined, "V2 不接受显式 none，禁用语义由响应层强制执行")
 })
 
 test("业务字段原样透传，只有门禁相关字段被补齐", () => {
@@ -77,17 +83,147 @@ test("用户自带工具时保留用户定义，并沿用用户的 tool_choice",
     ).body,
   )
   const names = body.tools.map((tool) => tool.function.name)
-  assert.ok(names.includes("get_weather") && names.includes("bash") && names.includes("read"))
+  assert.ok(names.includes("oc2api_get_weather") && names.includes("shell") && names.includes("read"))
   assert.equal(body.tool_choice, "auto")
 
-  // 用户自带 bash 时不能被门禁版本覆盖
-  const custom = { type: "function", function: { name: "bash", description: "mine", parameters: { type: "object" } } }
-  const replaced = JSON.parse(
-    buildUpstreamRequest({ model: "big-pickle", messages: [{ role: "user", content: "hi" }], tools: [custom] }, "ses_x")
-      .body,
+  // 同名客户端工具通过别名保留，不再占用或被覆盖成门禁定义。
+  const custom = { type: "function", function: { name: "shell", description: "mine", parameters: { type: "object" } } }
+  const request = buildUpstreamRequest(
+    { model: "big-pickle", messages: [{ role: "user", content: "hi" }], tools: [custom] },
+    "ses_x",
   )
-  assert.equal(replaced.tools.find((tool) => tool.function.name === "bash").function.description, "mine")
-  assert.equal(replaced.tools.filter((tool) => tool.function.name === "bash").length, 1)
+  const replaced = JSON.parse(request.body)
+  const clientShell = replaced.tools.find((tool) => tool.function.name === "oc2api_shell")
+  assert.match(clientShell.function.description, /mine/)
+  assert.deepEqual(clientShell.function.parameters, custom.function.parameters)
+  assert.equal(request.toolAliases.get("oc2api_shell"), "shell")
+  assert.deepEqual(
+    replaced.tools.find((tool) => tool.function.name === "shell"),
+    gateTool("shell"),
+  )
+  assert.equal(replaced.tools.filter((tool) => tool.function.name === "shell").length, 1)
+})
+
+test("同名 read/shell 保留客户端 schema，别名不撞已有工具，历史与指定选择同步映射", () => {
+  const read = Object.freeze({
+    type: "function",
+    function: Object.freeze({
+      name: "read",
+      description: "Read client file",
+      strict: true,
+      parameters: { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] },
+    }),
+  })
+  const shell = {
+    type: "function",
+    function: { name: "shell", parameters: { type: "object", properties: { script: { type: "string" } } } },
+  }
+  const existing = ["oc2api_read", "oc2api_read_1"].map((name) => ({
+    type: "function",
+    function: { name, parameters: { type: "object" } },
+  }))
+  const payload = {
+    model: "big-pickle",
+    messages: [
+      { role: "user", content: "Use read and shell" },
+      {
+        role: "assistant",
+        tool_calls: [
+          { id: "A", type: "function", function: { name: "read", arguments: '{"file_path":"README.md"}' } },
+          { id: "B", type: "function", function: { name: "shell", arguments: '{"script":"echo OK"}' } },
+        ],
+      },
+      { role: "tool", tool_call_id: "A", content: "file content" },
+      { role: "tool", tool_call_id: "B", content: "OK" },
+      { role: "assistant", function_call: { name: "read", arguments: '{"file_path":"README.md"}' } },
+      { role: "function", name: "read", content: "legacy result" },
+    ],
+    tools: [read, shell, ...existing],
+    tool_choice: { type: "function", function: { name: "read" } },
+  }
+  const snapshot = JSON.stringify(payload)
+  const request = buildUpstreamRequest(payload, "ses_x")
+  const body = JSON.parse(request.body)
+  assert.deepEqual(Object.fromEntries(request.toolAliases), {
+    oc2api_shell: "shell",
+    oc2api_read_2: "read",
+    oc2api_oc2api_read: "oc2api_read",
+    oc2api_oc2api_read_1: "oc2api_read_1",
+  })
+  assert.equal(new Set(body.tools.map((tool) => tool.function.name)).size, body.tools.length)
+  assert.deepEqual(
+    body.tools.find((tool) => tool.function.name === "oc2api_read_2").function.parameters,
+    read.function.parameters,
+  )
+  assert.equal(body.tools.find((tool) => tool.function.name === "oc2api_read_2").function.strict, true)
+  assert.deepEqual(
+    body.tools.find((tool) => tool.function.name === "read"),
+    gateTool("read"),
+  )
+  assert.deepEqual(
+    body.tools.find((tool) => tool.function.name === "shell"),
+    gateTool("shell"),
+  )
+  assert.equal(body.tool_choice.function.name, "oc2api_read_2")
+  assert.deepEqual(
+    body.messages[1].tool_calls.map((call) => call.function.name),
+    ["oc2api_read_2", "oc2api_shell"],
+  )
+  assert.deepEqual(
+    body.messages[1].tool_calls.map((call) => call.id),
+    ["A", "B"],
+  )
+  assert.deepEqual(body.messages.slice(2, 4), payload.messages.slice(2, 4))
+  assert.equal(body.messages[4].function_call.name, "oc2api_read_2")
+  assert.equal(body.messages[5].name, "oc2api_read_2")
+  assert.equal(JSON.stringify(payload), snapshot, "不能修改调用者的定义、历史或参数")
+  assert.ok(request.clientToolNames.includes("oc2api_oc2api_read"))
+  assert.ok(!request.clientToolNames.includes("read"))
+})
+
+test("所有客户端工具包括 edit/write 都隔离，允许列表选择与长名字保持合法映射", () => {
+  const longA = "a".repeat(64)
+  const longB = "a".repeat(63) + "b"
+  const names = ["read", "shell", "edit", "write", "glob", "grep", "get_weather", longA, longB]
+  const tools = names.map((name) => ({
+    type: "function",
+    function: {
+      name,
+      description: "Client definition",
+      parameters: { type: "object", properties: { file_path: { type: "string" } } },
+    },
+  }))
+  const payload = {
+    model: "big-pickle",
+    messages: [],
+    tools,
+    tool_choice: {
+      type: "allowed_tools",
+      mode: "auto",
+      tools: [
+        { type: "function", name: "edit" },
+        { type: "function", function: { name: "write" } },
+      ],
+    },
+  }
+  const request = buildUpstreamRequest(payload, "ses_x")
+  const body = JSON.parse(request.body)
+  assert.equal(request.toolAliases.size, names.length)
+  assert.equal(new Set(body.tools.map((tool) => tool.function.name)).size, body.tools.length)
+  for (const tool of body.tools.slice(0, tools.length)) {
+    assert.match(tool.function.name, /^[A-Za-z0-9_-]{1,64}$/)
+    const original = request.toolAliases.get(tool.function.name)
+    assert.ok(names.includes(original))
+    assert.notEqual(tool.function.name, original)
+    assert.deepEqual(
+      tool.function.parameters,
+      tools.find((source) => source.function.name === original).function.parameters,
+    )
+  }
+  assert.equal(body.tool_choice.tools[0].name, "oc2api_edit")
+  assert.equal(body.tool_choice.tools[1].function.name, "oc2api_write")
+  assert.equal(body.tool_choice.mode, "auto")
+  assert.deepEqual(body.tools.slice(-2), [gateTool("shell"), gateTool("read")])
 })
 
 test("max_tokens 缺省时才补默认值，用户显式传 0 之外的值不覆盖", () => {
@@ -234,12 +370,49 @@ test("buildUpstreamRequest 发出的 session 始终符合上游格式", () => {
   }
 })
 
-test("门禁工具定义带有禁止调用提示（不把描述当成强制保证）", () => {
-  const tool = gateTool("bash")
-  assert.equal(tool.type, "function")
-  assert.equal(tool.function.name, "bash")
-  assert.deepEqual(tool.function.parameters, { type: "object", properties: {} })
-  assert.match(tool.function.description, /do not call/i)
+test("V2 门禁工具保留官方描述前缀、参数 schema 和禁止调用提示", () => {
+  for (const [name, required, prefix] of [
+    ["shell", "command", "Execute a shell command and return its output."],
+    ["read", "path", "Read the contents of a file or directory."],
+  ]) {
+    const tool = gateTool(name)
+    assert.equal(tool.type, "function")
+    assert.equal(tool.function.name, name)
+    assert.ok(tool.function.description.startsWith(prefix))
+    assert.match(tool.function.description, /do not call/i)
+    assert.equal(tool.function.parameters.properties[required].type, "string")
+    assert.deepEqual(tool.function.parameters.required, [required])
+    assert.equal(tool.function.parameters.additionalProperties, false)
+    assert.equal(tool.function.strict, false)
+  }
+  assert.equal(gateTool("shell").function.parameters.properties.background.type, "boolean")
+  assert.equal(gateTool("read").function.parameters.properties.offset.minimum, 0)
+})
+
+test("禁用工具时不透传 none 或用户工具，也不修改用户消息", () => {
+  const tools = [{ type: "function", function: { name: "weather", parameters: { type: "object" } } }]
+  for (const input of [{}, { tools: [] }, { tools, tool_choice: "none" }]) {
+    const payload = { model: "big-pickle", messages: [{ role: "user", content: "hi" }], ...input }
+    const body = JSON.parse(buildUpstreamRequest(payload, "ses_x").body)
+    assert.equal(areToolsDisabled(payload), true)
+    assert.equal(body.tool_choice, undefined)
+    assert.deepEqual(
+      body.tools.map((tool) => tool.function.name),
+      ["shell", "read"],
+    )
+    assert.deepEqual(body.messages, payload.messages)
+  }
+  for (const choice of [undefined, "auto", "required", { type: "function", function: { name: "weather" } }]) {
+    const payload = { model: "big-pickle", messages: [], tools, tool_choice: choice }
+    assert.equal(areToolsDisabled(payload), false)
+    const body = JSON.parse(buildUpstreamRequest(payload, "ses_x").body)
+    assert.equal(body.tools[0].function.name, "oc2api_weather")
+    assert.deepEqual(body.tools[0].function.parameters, tools[0].function.parameters)
+    assert.deepEqual(
+      body.tool_choice,
+      typeof choice === "object" ? { ...choice, function: { name: "oc2api_weather" } } : choice,
+    )
+  }
 })
 
 test("reasoningEffort 别名恢复上游 snake_case，snake_case 优先", () => {

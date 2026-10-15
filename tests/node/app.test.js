@@ -117,10 +117,10 @@ test("合法请求端到端：流式与非流式都能拿到正文与 usage", as
   assert.match(nonStream.headers["x-request-id"] ?? "", /^req_/)
   assert.equal(forwarded.at(-1).stream, true, "上游只接受流式")
 
-  // 用户没传 tools：必须补齐免费层门禁工具并禁止选中它们
+  // 用户没传 tools：补齐 V2 门禁工具，不能发送上游拒绝的 none。
   const names = forwarded.at(-1).tools.map((tool) => tool.function.name)
-  assert.ok(names.includes("bash") && names.includes("read"))
-  assert.equal(forwarded.at(-1).tool_choice, "none")
+  assert.deepEqual(names, ["shell", "read"])
+  assert.equal(forwarded.at(-1).tool_choice, undefined)
 
   const stream = await post(server.url, { ...base, stream: true })
   assert.equal(stream.status, 200)
@@ -128,13 +128,13 @@ test("合法请求端到端：流式与非流式都能拿到正文与 usage", as
   assert.match(stream.text, /data: /)
   assert.equal(stream.text.split("[DONE]").length - 1, 1)
 
-  // 用户 tools 原样保留并沿用 tool_choice / temperature
+  // 用户工具 schema 保留、名字上游隔离，并沿用 tool_choice / temperature
   const weather = { type: "function", function: { name: "get_weather", parameters: { type: "object" } } }
   await post(server.url, { ...base, stream: false, tools: [weather], tool_choice: "auto", temperature: 0.5 })
   const last = forwarded.at(-1)
   assert.equal(last.tool_choice, "auto")
   assert.equal(last.temperature, 0.5)
-  assert.ok(last.tools.some((tool) => tool.function.name === "get_weather"))
+  assert.ok(last.tools.some((tool) => tool.function.name === "oc2api_get_weather"))
 })
 
 test("上游失败时返回 429，供账号池切换", async (t) => {
@@ -361,6 +361,133 @@ test("HTTP 两种模式都能完成两个工具调用、结果回填及下一轮
     })
     assert.equal(result.status, 200)
     assert.match(result.text, /hi/)
+  }
+  assert.equal(roundTrips, 2)
+})
+
+test("HTTP 禁用工具：不透传用户定义或 none，并拒绝上游意外工具调用", async (t) => {
+  const weather = { type: "function", function: { name: "weather", parameters: { type: "object" } } }
+  let raw = sse
+  const server = await fixture(t, async (_url, init) => {
+    const body = JSON.parse(init.body)
+    assert.equal(body.tool_choice, undefined)
+    assert.deepEqual(
+      body.tools.map((tool) => tool.function.name),
+      ["shell", "read"],
+    )
+    return new Response(raw)
+  })
+  for (const stream of [false, true]) {
+    const input = { ...base, stream, tools: [weather], tool_choice: "none" }
+    assert.equal((await post(server.url, input)).status, 200)
+    raw =
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"shell","arguments":"{}"}}]}}]}\n\n' +
+      "data: [DONE]\n\n"
+    for (const payload of [input, { ...base, stream }]) {
+      const response = await post(server.url, payload)
+      assert.equal(response.status, 429)
+      assert.match(JSON.parse(response.text).error.message, /tools are disabled/)
+      assert.ok(!response.text.includes("[DONE]"))
+    }
+    raw = sse
+  }
+})
+
+test("HTTP 同名客户端工具：上游隔离、下游恢复，工具结果回填仍使用原 schema 和 ID", async (t) => {
+  const read = {
+    type: "function",
+    function: {
+      name: "read",
+      description: "Client file reader",
+      parameters: { type: "object", properties: { file_path: { type: "string" } }, required: ["file_path"] },
+    },
+  }
+  const shell = {
+    type: "function",
+    function: { name: "shell", parameters: { type: "object", properties: { script: { type: "string" } } } },
+  }
+  let roundTrips = 0
+  const server = await fixture(t, async (_url, init) => {
+    const body = JSON.parse(init.body)
+    const byName = new Map(body.tools.map((tool) => [tool.function.name, tool.function]))
+    assert.deepEqual(byName.get("read").parameters.required, ["path"])
+    assert.deepEqual(byName.get("shell").parameters.required, ["command"])
+    assert.deepEqual(byName.get("oc2api_read").parameters, read.function.parameters)
+    assert.deepEqual(byName.get("oc2api_shell").parameters, shell.function.parameters)
+    if (body.messages.some((message) => message.role === "tool")) {
+      roundTrips++
+      const calls = body.messages.find((message) => message.tool_calls).tool_calls
+      assert.deepEqual(
+        calls.map((call) => call.function.name),
+        ["oc2api_read", "oc2api_shell"],
+      )
+      assert.deepEqual(
+        calls.map((call) => call.id),
+        ["read-id", "shell-id"],
+      )
+      assert.deepEqual(
+        body.messages.filter((message) => message.role === "tool").map((message) => message.content),
+        ["file result", "shell result"],
+      )
+      return new Response(sse)
+    }
+    const frame = {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: "read-id",
+                type: "function",
+                function: { name: "oc2api_read", arguments: '{"file_path":"README.md"}' },
+              },
+              {
+                index: 1,
+                id: "shell-id",
+                type: "function",
+                function: { name: "oc2api_shell", arguments: '{"script":"echo OK"}' },
+              },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    }
+    return new Response(`data: ${JSON.stringify(frame)}\n\ndata: [DONE]\n\n`)
+  })
+  for (const stream of [false, true]) {
+    const input = { ...base, tools: [read, shell], stream }
+    const first = await post(server.url, input)
+    assert.equal(first.status, 200)
+    let calls
+    if (stream) {
+      assert.ok(!first.text.includes("oc2api_"))
+      calls = first.text
+        .split("\n")
+        .filter((line) => line.startsWith("data: {"))
+        .flatMap((line) => JSON.parse(line.slice(6)).choices || [])
+        .flatMap((choice) => choice.delta?.tool_calls || [])
+    } else calls = JSON.parse(first.text).choices[0].message.tool_calls
+    assert.deepEqual(
+      calls.map((call) => call.function.name),
+      ["read", "shell"],
+    )
+    assert.deepEqual(
+      calls.map((call) => JSON.parse(call.function.arguments)),
+      [{ file_path: "README.md" }, { script: "echo OK" }],
+    )
+    const second = await post(server.url, {
+      ...input,
+      messages: [
+        ...base.messages,
+        { role: "assistant", tool_calls: calls },
+        { role: "tool", tool_call_id: "read-id", content: "file result" },
+        { role: "tool", tool_call_id: "shell-id", content: "shell result" },
+      ],
+    })
+    assert.equal(second.status, 200)
   }
   assert.equal(roundTrips, 2)
 })

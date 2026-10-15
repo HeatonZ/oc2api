@@ -74,7 +74,7 @@ test("chat routes to per-request Header, never to base_url query", async (t) => 
     body: JSON.stringify({ model: "big-pickle", messages: [{ role: "user", content: "hi" }] }),
   })
   assert.equal(result.status, 200)
-  assert.equal(calls[0].url, "https://header.example/zen/v1/chat/completions")
+  assert.equal(calls[0].url, "https://header.example/inference/v1/chat/completions")
 })
 
 test("models endpoint routes to request Header", async (t) => {
@@ -97,5 +97,5 @@ test("models endpoint routes to request Header", async (t) => {
     headers: { "x-opencode-base-url": "https://header.example" },
   })
   assert.equal(result.status, 200)
-  assert.equal(calls[0], "https://header.example/zen/v1/models")
+  assert.equal(calls[0], "https://header.example/inference/v1/models")
 })
