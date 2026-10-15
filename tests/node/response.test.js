@@ -141,7 +141,7 @@ test("上游工具别名跨帧恢复原名，流式/非流式保留原参数、I
         ["oc2api_read_2", "read"],
         ["oc2api_shell", "shell"],
       ]),
-      reservedToolNames: ["shell", "read"],
+      reservedToolNames: ["read"],
       clientToolNames: ["oc2api_read_2", "oc2api_shell"],
     },
   }
@@ -174,7 +174,7 @@ test("现有客户端工具名可与别名前缀重叠，不错误还原或暴�
     ctx: {
       toolAliases: new Map([["oc2api_read_1", "read"]]),
       clientToolNames: ["oc2api_read", "oc2api_read_1", "read_config"],
-      reservedToolNames: ["shell", "read"],
+      reservedToolNames: ["read"],
     },
   }
   for (const [parts, expected] of [
@@ -253,8 +253,8 @@ test("别名恢复支持 legacy function_call，且不会跨 choice 或请求串
 })
 
 test("保留工具调用和未完成别名必须报错，不能下发客户端可执行的原名或补 DONE", async () => {
-  const options = { ctx: { toolAliases: new Map([["oc2api_read", "read"]]), reservedToolNames: ["shell", "read"] } }
-  for (const name of ["shell", "read", "oc2api_"]) {
+  const options = { ctx: { toolAliases: new Map([["oc2api_read", "read"]]), reservedToolNames: ["read"] } }
+  for (const name of ["read", "oc2api_"]) {
     const chunks = [
       `data: ${JSON.stringify({
         choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "A", function: { name, arguments: "{}" } }] } }],

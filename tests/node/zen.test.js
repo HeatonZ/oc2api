@@ -29,7 +29,7 @@ test("免费层必要条件：UA、session、门禁工具、强制流式", () =>
   }
 
   const names = body.tools.map((tool) => tool.function.name)
-  assert.deepEqual(names, ["shell", "read"], "V2 使用 shell/read 而不是 bash/read")
+  assert.deepEqual(names, ["read"], "上游只要求 read 门禁，多余的 shell 会与客户端工具重名")
   assert.equal(body.tool_choice, undefined, "V2 不接受显式 none，禁用语义由响应层强制执行")
 })
 
@@ -83,28 +83,28 @@ test("用户自带工具时保留用户定义，并沿用用户的 tool_choice",
     ).body,
   )
   const names = body.tools.map((tool) => tool.function.name)
-  assert.ok(names.includes("oc2api_get_weather") && names.includes("shell") && names.includes("read"))
+  assert.ok(names.includes("oc2api_get_weather") && names.includes("read"))
   assert.equal(body.tool_choice, "auto")
 
   // 同名客户端工具通过别名保留，不再占用或被覆盖成门禁定义。
-  const custom = { type: "function", function: { name: "shell", description: "mine", parameters: { type: "object" } } }
+  const custom = { type: "function", function: { name: "read", description: "mine", parameters: { type: "object" } } }
   const request = buildUpstreamRequest(
     { model: "big-pickle", messages: [{ role: "user", content: "hi" }], tools: [custom] },
     "ses_x",
   )
   const replaced = JSON.parse(request.body)
-  const clientShell = replaced.tools.find((tool) => tool.function.name === "oc2api_shell")
-  assert.match(clientShell.function.description, /mine/)
-  assert.deepEqual(clientShell.function.parameters, custom.function.parameters)
-  assert.equal(request.toolAliases.get("oc2api_shell"), "shell")
+  const clientRead = replaced.tools.find((tool) => tool.function.name === "oc2api_read")
+  assert.match(clientRead.function.description, /mine/)
+  assert.deepEqual(clientRead.function.parameters, custom.function.parameters)
+  assert.equal(request.toolAliases.get("oc2api_read"), "read")
   assert.deepEqual(
-    replaced.tools.find((tool) => tool.function.name === "shell"),
-    gateTool("shell"),
+    replaced.tools.find((tool) => tool.function.name === "read"),
+    gateTool("read"),
   )
-  assert.equal(replaced.tools.filter((tool) => tool.function.name === "shell").length, 1)
+  assert.equal(replaced.tools.filter((tool) => tool.function.name === "read").length, 1)
 })
 
-test("同名 read/shell 保留客户端 schema，别名不撞已有工具，历史与指定选择同步映射", () => {
+test("同名 read 保留客户端 schema，别名不撞已有工具，历史与指定选择同步映射", () => {
   const read = Object.freeze({
     type: "function",
     function: Object.freeze({
@@ -159,10 +159,6 @@ test("同名 read/shell 保留客户端 schema，别名不撞已有工具，历�
   assert.deepEqual(
     body.tools.find((tool) => tool.function.name === "read"),
     gateTool("read"),
-  )
-  assert.deepEqual(
-    body.tools.find((tool) => tool.function.name === "shell"),
-    gateTool("shell"),
   )
   assert.equal(body.tool_choice.function.name, "oc2api_read_2")
   assert.deepEqual(
@@ -223,7 +219,7 @@ test("所有客户端工具包括 edit/write 都隔离，允许列表选择与�
   assert.equal(body.tool_choice.tools[0].name, "oc2api_edit")
   assert.equal(body.tool_choice.tools[1].function.name, "oc2api_write")
   assert.equal(body.tool_choice.mode, "auto")
-  assert.deepEqual(body.tools.slice(-2), [gateTool("shell"), gateTool("read")])
+  assert.deepEqual(body.tools.slice(-1), [gateTool("read")])
 })
 
 test("max_tokens 缺省时才补默认值，用户显式传 0 之外的值不覆盖", () => {
@@ -370,23 +366,19 @@ test("buildUpstreamRequest 发出的 session 始终符合上游格式", () => {
   }
 })
 
-test("V2 门禁工具保留官方描述前缀、参数 schema 和禁止调用提示", () => {
-  for (const [name, required, prefix] of [
-    ["shell", "command", "Execute a shell command and return its output."],
-    ["read", "path", "Read the contents of a file or directory."],
-  ]) {
-    const tool = gateTool(name)
-    assert.equal(tool.type, "function")
-    assert.equal(tool.function.name, name)
-    assert.ok(tool.function.description.startsWith(prefix))
-    assert.match(tool.function.description, /do not call/i)
-    assert.equal(tool.function.parameters.properties[required].type, "string")
-    assert.deepEqual(tool.function.parameters.required, [required])
-    assert.equal(tool.function.parameters.additionalProperties, false)
-    assert.equal(tool.function.strict, false)
-  }
-  assert.equal(gateTool("shell").function.parameters.properties.background.type, "boolean")
-  assert.equal(gateTool("read").function.parameters.properties.offset.minimum, 0)
+test("门禁工具用官方 read 名字与参数 schema，描述为旧版禁止调用文案", () => {
+  const tool = gateTool("read")
+  assert.equal(tool.type, "function")
+  assert.equal(tool.function.name, "read")
+  assert.equal(
+    tool.function.description,
+    "Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead.",
+  )
+  assert.equal(tool.function.parameters.properties.path.type, "string")
+  assert.deepEqual(tool.function.parameters.required, ["path"])
+  assert.equal(tool.function.parameters.additionalProperties, false)
+  assert.equal(tool.function.strict, false)
+  assert.equal(tool.function.parameters.properties.offset.minimum, 0)
 })
 
 test("禁用工具时不透传 none 或用户工具，也不修改用户消息", () => {
@@ -398,7 +390,7 @@ test("禁用工具时不透传 none 或用户工具，也不修改用户消息",
     assert.equal(body.tool_choice, undefined)
     assert.deepEqual(
       body.tools.map((tool) => tool.function.name),
-      ["shell", "read"],
+      ["read"],
     )
     assert.deepEqual(body.messages, payload.messages)
   }
@@ -454,7 +446,7 @@ test("buildUpstreamRequest 不修改用户工具、消息或参数原对象", ()
   })
   const body = JSON.parse(buildUpstreamRequest(payload, "ses_x").body)
   assert.equal(payload.tools.length, 1)
-  assert.equal(body.tools.length, 3)
+  assert.equal(body.tools.length, 2)
   assert.equal(body.max_tokens, 0)
   assert.deepEqual(body.messages, payload.messages)
 })

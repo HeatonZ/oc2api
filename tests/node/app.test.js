@@ -117,9 +117,9 @@ test("合法请求端到端：流式与非流式都能拿到正文与 usage", as
   assert.match(nonStream.headers["x-request-id"] ?? "", /^req_/)
   assert.equal(forwarded.at(-1).stream, true, "上游只接受流式")
 
-  // 用户没传 tools：补齐 V2 门禁工具，不能发送上游拒绝的 none。
+  // 用户没传 tools：补齐唯一的 read 门禁工具，不能发送上游拒绝的 none。
   const names = forwarded.at(-1).tools.map((tool) => tool.function.name)
-  assert.deepEqual(names, ["shell", "read"])
+  assert.deepEqual(names, ["read"])
   assert.equal(forwarded.at(-1).tool_choice, undefined)
 
   const stream = await post(server.url, { ...base, stream: true })
@@ -373,7 +373,7 @@ test("HTTP 禁用工具：不透传用户定义或 none，并拒绝上游意外�
     assert.equal(body.tool_choice, undefined)
     assert.deepEqual(
       body.tools.map((tool) => tool.function.name),
-      ["shell", "read"],
+      ["read"],
     )
     return new Response(raw)
   })
@@ -411,7 +411,6 @@ test("HTTP 同名客户端工具：上游隔离、下游恢复，工具结果回
     const body = JSON.parse(init.body)
     const byName = new Map(body.tools.map((tool) => [tool.function.name, tool.function]))
     assert.deepEqual(byName.get("read").parameters.required, ["path"])
-    assert.deepEqual(byName.get("shell").parameters.required, ["command"])
     assert.deepEqual(byName.get("oc2api_read").parameters, read.function.parameters)
     assert.deepEqual(byName.get("oc2api_shell").parameters, shell.function.parameters)
     if (body.messages.some((message) => message.role === "tool")) {

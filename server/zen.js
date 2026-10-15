@@ -2,8 +2,8 @@
 //   1. User-Agent 必须形如 opencode/<channel>/<version>/<client>，其他一律 403；
 //   2. 必须带 x-opencode-session，且其前 12 位 hex 必须是「倒置毫秒时间戳」
 //      ~(BigInt(Date.now()) * 4096n + counter)；格式不符或前缀是随机值一律 403；
-//   3. 请求体必须含 shell / read 两个"门禁工具"（V2 起 shell 取代 bash），
-//      且描述与参数 schema 要对齐 V2，空 schema 会被 403；
+//   3. 请求体必须含内置 read 门禁工具（名字与参数 schema 保持 V2 read 形态，
+//      改名或空 properties 都会被 403）；只带 read 必定放行，缺 read 一律 403；
 //   4. stream 必须为 true，stream:false 一律 403；
 //   5. 显式 tool_choice:none 也会被 403，改用保留工具描述并在响应层禁止工具调用。
 // 除此之外上游就是标准 OpenAI 协议，本模块只补齐上述条件，业务字段原样透传。
@@ -69,38 +69,33 @@ if (!Number.isFinite(CONNECT_TIMEOUT_MS) || CONNECT_TIMEOUT_MS < 1 || CONNECT_TI
   throw new Error("ZEN_CONNECT_TIMEOUT_MS must be between 1 and 600000 milliseconds")
 }
 
-// V2 使用 shell 而不是 bash；只补真实上游已验证的最小集合。
-const GATE_TOOL_NAMES = ["shell", "read"]
+// 上游只把 read 当作必需门禁：实测只带 read 必定放行，只带 shell/edit/write/glob 等一律 403。
+// 少注入一个门禁就少一个与客户端工具重名的干扰源，所以只保留 read。
+const GATE_TOOL_NAMES = ["read"]
 
 // 这些键名在 JS 里有特殊含义，用户塞进请求体没有任何意义，一律不转发给上游。
 const DANGEROUS_KEYS = ["__proto__", "constructor", "prototype"]
 
+// 旧版「禁止调用」描述。上游不校验文案（空描述同样放行），用最直白的旧写法，
+// 不再拼 V2 的业务原句，避免和客户端工具的描述混淆模型。
 const GATE_TOOL_DESCRIPTION =
   "Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead."
 
 export function gateTool(name) {
-  // 描述前缀与 schema 对齐 V2 的 tool/plugin/{shell,read}.ts；空 schema 不再放行。
-  const shell = name === "shell"
+  // 名字和参数 schema 必须保持 V2 read 的形态：改名、空 properties 都会被上游 403。
   return {
     type: "function",
     function: {
       name,
-      description: `${shell ? "Execute a shell command and return its output." : "Read the contents of a file or directory."} ${GATE_TOOL_DESCRIPTION}`,
+      description: GATE_TOOL_DESCRIPTION,
       parameters: {
         type: "object",
-        properties: shell
-          ? {
-              command: { type: "string", description: "Shell command string to execute" },
-              workdir: { type: "string", description: "Working directory to execute the command in" },
-              timeout: { type: "integer", minimum: 0, description: "Timeout in milliseconds" },
-              background: { type: "boolean", description: "Run the command in the background" },
-            }
-          : {
-              path: { type: "string", description: "File or directory to read" },
-              offset: { type: "integer", minimum: 0, description: "Starting line or directory entry (1-based)" },
-              limit: { type: "integer", minimum: 0, description: "Maximum lines or directory entries to read" },
-            },
-        required: [shell ? "command" : "path"],
+        properties: {
+          path: { type: "string", description: "File or directory to read" },
+          offset: { type: "integer", minimum: 0, description: "Starting line or directory entry (1-based)" },
+          limit: { type: "integer", minimum: 0, description: "Maximum lines or directory entries to read" },
+        },
+        required: ["path"],
         additionalProperties: false,
       },
       strict: false,
