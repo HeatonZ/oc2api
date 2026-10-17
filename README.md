@@ -1,6 +1,6 @@
 # oc2api
 
-> ⚠️ **2026-08-21 提醒**：`deepseek-v4-flash-free` 模型已官方下线，不再提供免费额度。如需使用请更换其他模型，建议用 `big-pickle` 和 `mimo-v2.6-flash-free`，其中 `mimo-v2.6-flash-free` 支持图片输入。
+> 📌 **OpenCode 最新上线了两个免费模型**：`deepseek-v4.1-flash-free` 和 `glm-5.3-flash-free`，均为 200,000 上下文、支持图片输入。完整对比见 [免费模型](#免费模型)。
 
 OpenCode Free API 代理，使用一套 Express 业务逻辑，同时支持本地运行、Docker 和 Vercel 部署，并支持 SSE 流式响应。
 
@@ -57,7 +57,7 @@ npm start
 API_KEY=your-key DEBUG=true PORT=8080 npm start
 ```
 
-可选的本地上游中继（例如 proxy-router）可以在 OC2API 转换响应前处理限流重试：
+可选的本地上游中继可以在 OC2API 转换响应前处理限流重试：
 
 ```sh
 ZEN_API_BASE_URL=http://127.0.0.1:2082/v1 ZEN_CONNECT_TIMEOUT_MS=300000 npm start
@@ -65,9 +65,8 @@ ZEN_API_BASE_URL=http://127.0.0.1:2082/v1 ZEN_CONNECT_TIMEOUT_MS=300000 npm star
 
 如果网关能在每个请求上发送 `X-OpenCode-Base-URL`，该 Header 的优先级高于 `BASE_URL` 和 `ZEN_API_BASE_URL`，并同时用于聊天及模型列表；这可让同一实例按请求走不同上游。`base_url` 查询参数不生效。请求级模型列表不会写入共享缓存。
 
-`ZEN_API_BASE_URL` 默认是 `https://opencode.ai/inference/v1`（OpenCode V2 上游），同时用于模型列表和聊天。
-`ZEN_CONNECT_TIMEOUT_MS` 默认是 60000 毫秒，允许 1–600000；中继重试时应设置为大于其恢复窗口。
-它只控制收到响应头之前的等待时间，后续流式读取仍使用已有的超时机制。
+- `ZEN_API_BASE_URL`：上游地址，默认 `https://opencode.ai/inference/v1`
+- `ZEN_CONNECT_TIMEOUT_MS`：收到响应头前的等待时间，默认 60000 毫秒，允许 1–600000；使用中继重试时应设置为大于其恢复窗口
 
 健康检查：
 
@@ -77,37 +76,9 @@ curl http://localhost:8080/health
 
 ## Docker 部署
 
-Docker 配置位于项目根目录：
-
 ```bash
 docker compose up -d --build
 ```
-
-## 测试
-
-离线测试不访问 OpenCode：
-
-```bash
-npm test
-```
-
-真实联调包含 11 个用例：非流式回答、流式多轮对话、禁用工具、实际工具调用、工具结果回填、三个并行工具调用，以及客户端同名 `read(file_path)` 的指定调用与结果回填。全部首轮成功时至少发送 13 次 `big-pickle` 请求，工具自主选择的有限重试会增加请求数。Vercel 用例通过本地 HTTP 服务加载其入口，不等于远程 Vercel 部署验收：
-
-```bash
-npm run test:live
-```
-
-离线运行时联调用例跳过；显式启用联调后，HTTP 错误、超时、协议错误和未能实际调用工具均视为失败，不能用 skip 冒充通过。每个用例总预算为 120 秒，单次请求最多 90 秒；工具选择最多尝试三次，但仍受用例总预算约束。真实上游限流也会使联调失败，不影响离线测试。
-
-## 代码检查
-
-```bash
-npm run lint          # ESLint 静态检查
-npm run format:check  # 检查格式是否规范
-npm run format        # 用 Prettier 自动格式化全部文件
-```
-
-GitHub Actions 与 Docker 构建都会先执行 lint 和格式检查，不通过则构建失败。
 
 ## API
 
@@ -128,34 +99,41 @@ Authorization: Bearer <api-key>
 
 也支持 `X-API-Key`。
 
-### OpenCode V2 兼容
+客户端工具、工具选择、历史工具调用和多轮工具结果回填均可正常使用，工具名与参数原样往返。
 
-上游请求使用 V2 的 User-Agent 与会话关联 headers，不发送旧版非标准的 `x-opencode-request`。免费层只强制要求内置 `read` 工具（名字与参数 schema），代理始终提供这一个保留工具。上游也会校验 `edit` 等内置同名工具，因此客户端实际提供的工具统一使用不冲突的上游别名，不需要维护服务端保留名称黑名单，也不添加客户端未提供的其它工具。客户端参数 schema 保留；指定工具选择和历史工具调用同步映射，响应中的工具名还原，调用 ID、参数和工具结果不变。不会把客户端的 `read(file_path)` 强行替换成门禁的 `read(path)`，也不注入 OpenCode 系统提示词或改写消息正文。
+## 免费模型
 
-保留工具不能执行。上游误选保留工具时按错误结束，不把它当成客户端同名工具返回。`DEBUG=true` 的请求日志包含工具名和别名映射，不记录用户消息正文，便于排查实际客户端兼容问题。
+代理仅放行免费模型（`big-pickle` 及所有以 `-free` 结尾的模型）。以下是常用且已验证可用的几个：
 
-V2 免费层拒绝显式 `tool_choice: "none"`。下游未提供工具或显式禁用工具时，代理不向上游提供用户工具，也不透传 `none`；保留工具带有禁止调用提示。响应层强制拒绝任何意外工具调用：响应头发送前返回 `429`，流式输出开始后发送 SSE 错误且不补 `[DONE]`，不会把工具调用伪装为正常回答。其余工具选择照常透传。
+| 模型                       | 上下文  | 输出   | 图片输入 |
+| -------------------------- | ------- | ------ | -------- |
+| `big-pickle`               | 200,000 | 32,000 | ❌       |
+| `mimo-v2.6-flash-free`     | 200,000 | 32,000 | ✅       |
+| `deepseek-v4.1-flash-free` | 200,000 | 32,000 | ✅       |
+| `glm-5.3-flash-free`       | 200,000 | 32,000 | ✅       |
 
-## 免费模型限制
+- `context`：最大上下文窗口，单位 tokens
+- `output`：最大单次输出长度，单位 tokens
 
-代理仅放行免费模型（`big-pickle` 及所有以 `-free` 结尾的模型），以 `big-pickle` 为例：
+以上数据来源于 [https://models.opencode.ai/api.json](https://models.opencode.ai/api.json)（`opencode` key 下对应模型的 `limit` 与 `modalities` 字段），可自行查看核实，以实际使用为准。
 
-```json
-{
-  "id": "big-pickle",
-  "limit": {
-    "context": 200000,
-    "output": 32000
-  }
-}
+## 错误处理
+
+上游返回 HTTP 错误时透出可判断的真实语义，不再一律归一成 `429`：只有上游真的限流才是 `429`（`rate_limit_error`），参数错误为 `400`（`invalid_request_error`），鉴权失败为 `401`/`403`（`authentication_error`），服务端问题为 `5xx`（`upstream_error`）。这样客户端能区分「额度用尽」和「请求写错了」，也便于把问题反馈给上游。流式响应头尚未发送前错误以普通 JSON 返回；头已发送后返回 SSE 错误事件且不补 `[DONE]`。oc2api 自身的流异常（缺少完成信号、上游误选保留工具）使用 `502`（`upstream_stream_error`）；建连网络失败、建连超时及模型列表错误使用 `502` / `504`。
+
+上游误选代理内部保留工具时按错误结束，不会把它当成客户端同名工具交回客户端执行。
+
+## 开发
+
+```bash
+npm test              # 离线测试，不访问上游；CI 只跑这个
+npm run test:live     # 真实联调，需要网络，不进 CI
+npm run lint          # ESLint 静态检查
+npm run format:check  # 检查格式
+npm run format        # Prettier 自动格式化
 ```
 
-- `context`：最大上下文窗口，**200,000** tokens
-- `output`：最大单次输出长度，**32,000** tokens
-
-以上限制数据来源于接口 [https://models.opencode.ai/api.json](https://models.opencode.ai/api.json)（`opencode` key 下对应模型的 `limit` 字段），可自行查看核实，以实际使用为准。
-
-聊天上游返回 HTTP 错误或流解析失败时，在下游响应头尚未发送前归一为 `429`，便于账号池切换；流式头已发送后只能返回 SSE 错误事件，且不补 `[DONE]`。建连网络失败、建连超时及模型列表错误仍沿用原有的 `502` / `504` 分类。
+联调用例会对 `big-pickle`、`mimo-v2.6-flash-free`、`deepseek-v4.1-flash-free`、`glm-5.3-flash-free` 各跑一次多轮连续工具调用（含与内置同名的客户端 `read`），真实请求上游，受免费层限流影响；未设置 `OC2API_LIVE_TEST=1` 时自动跳过。因为依赖真实模型和上游配额，它不纳入 CI 门禁，需要时本地执行。
 
 ## 免费层会话标识（x-opencode-session）
 
