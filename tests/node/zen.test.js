@@ -11,6 +11,7 @@ import {
   inboundSessionSeed,
   isAllowedModelId,
   resolveSession,
+  ZEN_MIN_CLIENT_VERSION,
 } from "../../server/zen.js"
 
 test("免费层必要条件：UA、session、门禁工具、强制流式", () => {
@@ -19,7 +20,11 @@ test("免费层必要条件：UA、session、门禁工具、强制流式", () =>
 
   assert.equal(body.stream, true, "stream:false 会被上游 403，必须强制 true")
   assert.deepEqual(body.stream_options, { include_usage: true })
-  assert.equal(request.headers["User-Agent"], "opencode/latest/2.0.29/cli")
+  assert.equal(
+    request.headers["User-Agent"],
+    "opencode/latest/2.0.32/cli",
+    "版本号是上游硬门槛：低于 1.18.0 会 426 UpgradeRequired",
+  )
   assert.equal(request.headers.Authorization, "Bearer public")
   assert.equal(request.headers["x-opencode-client"], "cli")
   assert.equal(request.headers["x-opencode-project"], "global")
@@ -419,19 +424,35 @@ test("buildUpstreamRequest 发出的 session 始终符合上游格式", () => {
   }
 })
 
-test("门禁工具用官方 read 名字与参数 schema，描述为旧版禁止调用文案", () => {
+test("门禁工具用官方 read 名字与参数 schema，描述对齐 OpenCode 2.0.32", () => {
   const tool = gateTool("read")
   assert.equal(tool.type, "function")
   assert.equal(tool.function.name, "read")
-  assert.equal(
-    tool.function.description,
-    "Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead.",
-  )
+  // 描述跟随真实客户端文案；上游不校验文案，但形状一致能减少差异面。
+  assert.match(tool.function.description, /^Read the contents of a file or directory\./)
+  assert.match(tool.function.description, /1-based line number/)
   assert.equal(tool.function.parameters.properties.path.type, "string")
   assert.deepEqual(tool.function.parameters.required, ["path"])
   assert.equal(tool.function.parameters.additionalProperties, false)
   assert.equal(tool.function.strict, false)
   assert.equal(tool.function.parameters.properties.offset.minimum, 0)
+  assert.equal(tool.function.parameters.properties.limit.minimum, 0)
+})
+
+test("UA 版本必须高于上游免费层门槛，否则整池 426", () => {
+  // 实测：1.17.9 及以下回 426 UpgradeRequired，
+  // 原文 "OpenCode 1.18.0 or newer is required to use the free tier"。
+  const ua = buildUpstreamRequest(
+    { model: "big-pickle", messages: [{ role: "user", content: "hi" }] },
+    "ses_x",
+  ).headers["User-Agent"]
+  const version = ua.split("/")[2]
+  const [major, minor] = version.split(".").map(Number)
+  const [minMajor, minMinor] = ZEN_MIN_CLIENT_VERSION.split(".").map(Number)
+  assert.ok(
+    major > minMajor || (major === minMajor && minor >= minMinor),
+    `UA 版本 ${version} 低于上游门槛 ${ZEN_MIN_CLIENT_VERSION}，会整池 426`,
+  )
 })
 
 test("禁用工具时不透传 none 或用户工具，也不修改用户消息", () => {

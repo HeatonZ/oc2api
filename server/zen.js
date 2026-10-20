@@ -61,7 +61,15 @@ export function zenEndpoint(relativePath, requestOverride = "") {
 }
 
 // 对齐 App.useragent：opencode/<channel>/<version>/<client>。
-const ZEN_USER_AGENT = "opencode/latest/2.0.29/cli"
+// 版本号是上游的硬门槛，不是装饰：实测 /inference/v1/chat/completions 用
+// opencode/latest/1.17.9/cli 会拿到 426 UpgradeRequired，原文
+// "OpenCode 1.18.0 or newer is required to use the free tier"；1.18.0 起放行。
+// 2.0.32 是 2026-10-20 opencode2api 对齐的真实客户端版本，直接跟随，
+// 避免版本号随上游门槛上移后再次静默失效。
+const ZEN_USER_AGENT = "opencode/latest/2.0.32/cli"
+
+// 上游免费层要求的客户端最低版本（426 原文）。仅用于启动自检与日志提示。
+export const ZEN_MIN_CLIENT_VERSION = "1.18.0"
 
 // 建立连接与模型列表的超时。注意：响应头之后的读取由 openai.js 的看门狗负责。
 const CONNECT_TIMEOUT_MS = Number(process.env.ZEN_CONNECT_TIMEOUT_MS || 60 * 1000)
@@ -78,22 +86,37 @@ const DANGEROUS_KEYS = ["__proto__", "constructor", "prototype"]
 
 // 旧版「禁止调用」描述。上游不校验文案（空描述同样放行），用最直白的旧写法，
 // 不再拼 V2 的业务原句，避免和客户端工具的描述混淆模型。
-const GATE_TOOL_DESCRIPTION =
+// 现保留为导出的备用文案：自定义门禁工具名时可用，避免调用点再拼字符串。
+export const GATE_TOOL_DESCRIPTION =
   "Reserved for the host runtime; do not call or select this function. Use tools explicitly supplied by the user instead."
+
+// 上游 2.0.32 真实 read 的描述与参数文案。与 opencode2api 的 opencode_tools.json
+// 逐字对齐：描述只影响模型观感，但保持与真实客户端一致可减少形状差异面。
+const GATE_READ_DESCRIPTION =
+  "Read the contents of a file or directory. Supports text files, images, and PDFs. Images and PDFs are presented directly to the model. Each text line is prefixed by its 1-based line number as <line>: <content>. The prefix is for reference and is not part of the file content. Directory entries are returned one per line. Use offset and limit to read large files or directories in sections. Prefer one larger read over many small slices, and use grep to find specific content in large files."
 
 export function gateTool(name) {
   // 名字和参数 schema 必须保持 V2 read 的形态：改名、空 properties 都会被上游 403。
+  // 描述用 2.0.32 的真实文案；参数名与 required 维持实测放行的形态。
   return {
     type: "function",
     function: {
       name,
-      description: GATE_TOOL_DESCRIPTION,
+      description: GATE_READ_DESCRIPTION,
       parameters: {
         type: "object",
         properties: {
           path: { type: "string", description: "File or directory to read" },
-          offset: { type: "integer", minimum: 0, description: "Starting line or directory entry (1-based)" },
-          limit: { type: "integer", minimum: 0, description: "Maximum lines or directory entries to read" },
+          offset: {
+            type: "integer",
+            minimum: 0,
+            description: "The line or directory entry to start reading from (1-based)",
+          },
+          limit: {
+            type: "integer",
+            minimum: 0,
+            description: "The maximum number of lines or directory entries to read (defaults to and capped at 2000)",
+          },
         },
         required: ["path"],
         additionalProperties: false,
@@ -223,7 +246,9 @@ export function buildUpstreamRequest(payload, sessionId) {
       .map((tool) => tool?.function?.name)
       .filter((name) => name && !GATE_TOOL_NAMES.includes(name)),
     headers: {
-      Accept: "text/event-stream",
+      // 真实 2.x CLI 的 fetch 把 Accept 写成两者并列（opencode2api 对齐 2.0.32 后
+      // 也是这个形态）；只写 text/event-stream 与真实客户端不一致。
+      Accept: "application/json, text/event-stream",
       "Content-Type": "application/json",
       Authorization: "Bearer public",
       "User-Agent": ZEN_USER_AGENT,

@@ -18,7 +18,11 @@ test("default upstream uses V2 inference for both models and chat", async (t) =>
   await zen.fetchUpstream(request, { requestId: "test", model: "big-pickle" })
   assert.equal(calls[0][0], "https://opencode.ai/inference/v1/models")
   assert.equal(calls[1][0], "https://opencode.ai/inference/v1/chat/completions")
-  assert.equal(calls[0][1].headers["User-Agent"], "opencode/latest/2.0.29/cli")
+  assert.equal(
+    calls[0][1].headers["User-Agent"],
+    "opencode/latest/2.0.32/cli",
+    "版本号是上游硬门槛：低于 1.18.0 会 426 UpgradeRequired",
+  )
   assert.equal(calls[1][1].headers["x-opencode-request"], undefined)
 })
 
