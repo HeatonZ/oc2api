@@ -442,10 +442,8 @@ test("门禁工具用官方 read 名字与参数 schema，描述对齐 OpenCode 
 test("UA 版本必须高于上游免费层门槛，否则整池 426", () => {
   // 实测：1.17.9 及以下回 426 UpgradeRequired，
   // 原文 "OpenCode 1.18.0 or newer is required to use the free tier"。
-  const ua = buildUpstreamRequest(
-    { model: "big-pickle", messages: [{ role: "user", content: "hi" }] },
-    "ses_x",
-  ).headers["User-Agent"]
+  const ua = buildUpstreamRequest({ model: "big-pickle", messages: [{ role: "user", content: "hi" }] }, "ses_x")
+    .headers["User-Agent"]
   const version = ua.split("/")[2]
   const [major, minor] = version.split(".").map(Number)
   const [minMajor, minMinor] = ZEN_MIN_CLIENT_VERSION.split(".").map(Number)
