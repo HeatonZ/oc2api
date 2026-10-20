@@ -1,6 +1,10 @@
+name: oc2api
+
 services:
   oc2api:
-    build: .
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
     container_name: oc2api
     ports:
       - "${PORT:-8080}:8080"

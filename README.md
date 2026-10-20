@@ -74,8 +74,10 @@ curl http://localhost:8080/health
 
 ## Docker 部署
 
+镜像定义与编排文件统一放在 `docker/` 目录下（根目录不放 Dockerfile，避免 Vercel 把项目误判为容器项目）：
+
 ```bash
-docker compose up -d --build
+cd docker && docker compose up -d --build
 ```
 
 ## API
