@@ -101,7 +101,7 @@ cd docker && docker compose up -d --build
 </details>
 
 <details>
-<summary><b>3. Vercel</b> — 一条命令部署，但出口 IP 常被上游限流</summary>
+<summary><b>3. Vercel</b> — 网页导入仓库即可部署，但出口 IP 常被上游限流</summary>
 
 <br>
 
