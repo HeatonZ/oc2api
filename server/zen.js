@@ -287,7 +287,7 @@ export function buildUpstreamRequest(payload, sessionId) {
 }
 
 // 只在建立连接阶段计时；响应头一到就交给调用方，避免把长回答误杀。
-export async function fetchUpstream(request, ctx) {
+async function fetchOnce(request, ctx) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort("timeout"), CONNECT_TIMEOUT_MS)
   const started = Date.now()
@@ -312,6 +312,44 @@ export async function fetchUpstream(request, ctx) {
   } finally {
     clearTimeout(timer)
   }
+}
+
+// 上游并非所有后端都接受 reasoning_effort="none"：big-pickle 会落到不同后端，
+// 其中 mai-experimental 只认 low/medium/high/xhigh，对 none 直接 400
+// `does not support reasoning_effort='none'`。这种拒绝发生在生成之前、不产生费用，
+// 所以可以去掉该字段重试一次（客户端仍然看不到思考内容）；其它 400 原样返回，
+// 不掩盖真实错误，也不改变"上游支持 none 就真的关思考"的行为。
+const REASONING_UNSUPPORTED = /does not support reasoning_effort/i
+
+function withoutReasoningEffort(body) {
+  try {
+    const parsed = JSON.parse(body)
+    delete parsed.reasoning_effort
+    return JSON.stringify(parsed)
+  } catch {
+    return body
+  }
+}
+
+export async function fetchUpstream(request, ctx) {
+  const first = await fetchOnce(request, ctx)
+  if (first.status !== 400 || !String(request.body).includes('"reasoning_effort"')) return first
+
+  // 只在需要判断时读一次错误体，用 clone 保证原始响应仍可正常返回给调用方。
+  let text
+  try {
+    text = await first.clone().text()
+  } catch {
+    return first
+  }
+  if (!REASONING_UNSUPPORTED.test(text)) return first
+
+  debugLog("[ZEN RETRY]", {
+    requestId: ctx.requestId,
+    model: ctx.model,
+    reason: "upstream does not support reasoning_effort",
+  })
+  return fetchOnce({ ...request, body: withoutReasoningEffort(request.body) }, ctx)
 }
 
 let cachedModels = null

@@ -487,7 +487,9 @@ test("禁用工具时不透传 none 或用户工具，也不修改用户消息",
 test("reasoningEffort 别名恢复上游 snake_case，snake_case 优先", () => {
   for (const [input, expected] of [
     [{ reasoningEffort: "none" }, "none"],
+    [{ reasoning_effort: "none" }, "none"],
     [{ reasoningEffort: "high" }, "high"],
+    [{ reasoningEffort: "xhigh" }, "xhigh"],
     [{ reasoning_effort: "low", reasoningEffort: "high" }, "low"],
     [{ reasoning_effort: null, reasoningEffort: "medium" }, "medium"],
     [{ reasoning_effort: "" }, undefined],
