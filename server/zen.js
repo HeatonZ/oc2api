@@ -19,6 +19,8 @@
 //   a. 可配置上游 base URL，且支持请求级覆盖：
 //      X-OpenCode-Base-URL Header > BASE_URL env > ZEN_API_BASE_URL > 默认地址；
 //   b. 会话标识按调用方透传的稳定标识派生，而不是按 user 复用（见 resolveSession）。
+import { createHash } from "node:crypto"
+
 import { debugLog } from "./log.js"
 
 const DEFAULT_BASE_URL = "https://opencode.ai"
@@ -29,6 +31,24 @@ const ZEN_API_BASE_URL = (process.env.ZEN_API_BASE_URL || "").trim()
 // 避免重复拼接。
 const ZEN_API_PATH = "/inference/v1"
 const VERSION_PATH_SUFFIXES = ["/inference/v1", "/zen/v1", "/v1"]
+
+export function normalizeZenBase(raw) {
+  const base = String(raw || "")
+    .trim()
+    .replace(/\/+$/, "")
+  let url
+  try {
+    url = new URL(base)
+  } catch {
+    return base
+  }
+  if (url.hostname !== "opencode.ai" && !url.hostname.endsWith(".opencode.ai")) return base
+  const rest = url.pathname.replace(/^\/zen(?=\/|$)/, "")
+  // /zen/go 是付费 Go 网关，和免费层无关，不改写。
+  if (rest === url.pathname || rest === "/go" || rest.startsWith("/go/")) return base
+  url.pathname = `/inference${rest}`
+  return url.toString().replace(/\/+$/, "")
+}
 
 export function resolveBaseURL(requestOverride = "") {
   const override = String(requestOverride || "").trim()
@@ -45,7 +65,8 @@ export function resolveBaseURL(requestOverride = "") {
     throw new Error("base URL must use http:// or https://")
   }
   if (!parsed.host) throw new Error("base URL must include a host")
-  return value
+  // opencode.ai 上的 /zen* 改写到 /inference；resin 路径反代/自建中继原样保留。
+  return normalizeZenBase(value)
 }
 
 export function requestBaseURL(request) {
@@ -59,6 +80,9 @@ export function zenEndpoint(relativePath, requestOverride = "") {
   if (VERSION_PATH_SUFFIXES.some((suffix) => base.endsWith(suffix))) return `${base}/${relativePath}`
   return `${base}${ZEN_API_PATH}/${relativePath}`
 }
+
+// 供诊断端点展示，避免部署后无法确认实际打到了哪个上游。
+export const zenBaseUrl = ZEN_API_BASE_URL
 
 // 对齐 App.useragent：opencode/<channel>/<version>/<client>。
 // 版本号是上游的硬门槛，不是装饰：实测 /inference/v1/chat/completions 用
@@ -263,7 +287,7 @@ export function buildUpstreamRequest(payload, sessionId) {
 }
 
 // 只在建立连接阶段计时；响应头一到就交给调用方，避免把长回答误杀。
-export async function fetchUpstream(request, ctx) {
+async function fetchOnce(request, ctx) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort("timeout"), CONNECT_TIMEOUT_MS)
   const started = Date.now()
@@ -288,6 +312,44 @@ export async function fetchUpstream(request, ctx) {
   } finally {
     clearTimeout(timer)
   }
+}
+
+// 上游并非所有后端都接受 reasoning_effort="none"：big-pickle 会落到不同后端，
+// 其中 mai-experimental 只认 low/medium/high/xhigh，对 none 直接 400
+// `does not support reasoning_effort='none'`。这种拒绝发生在生成之前、不产生费用，
+// 所以可以去掉该字段重试一次（客户端仍然看不到思考内容）；其它 400 原样返回，
+// 不掩盖真实错误，也不改变"上游支持 none 就真的关思考"的行为。
+const REASONING_UNSUPPORTED = /does not support reasoning_effort/i
+
+function withoutReasoningEffort(body) {
+  try {
+    const parsed = JSON.parse(body)
+    delete parsed.reasoning_effort
+    return JSON.stringify(parsed)
+  } catch {
+    return body
+  }
+}
+
+export async function fetchUpstream(request, ctx) {
+  const first = await fetchOnce(request, ctx)
+  if (first.status !== 400 || !String(request.body).includes('"reasoning_effort"')) return first
+
+  // 只在需要判断时读一次错误体，用 clone 保证原始响应仍可正常返回给调用方。
+  let text
+  try {
+    text = await first.clone().text()
+  } catch {
+    return first
+  }
+  if (!REASONING_UNSUPPORTED.test(text)) return first
+
+  debugLog("[ZEN RETRY]", {
+    requestId: ctx.requestId,
+    model: ctx.model,
+    reason: "upstream does not support reasoning_effort",
+  })
+  return fetchOnce({ ...request, body: withoutReasoningEffort(request.body) }, ctx)
 }
 
 let cachedModels = null
@@ -340,23 +402,27 @@ async function fetchZenModels(baseURL = "") {
 //         其中低 12 位的 counter 必须落在接受区间内（实测 0~32 通过、64 起 403）。
 //         高 36 位（时间戳）实测不被校验，但按官方格式写才安全。
 // 随机 hex / sha256 摘要的 counter 是任意值，绝大多数落在区间外，于是被判为非
-// OpenCode 客户端并回 403 FreeTierError
-// （原文 "OpenCode's free tier can only be used from within OpenCode"）。
+// OpenCode 客户端并回 403 FreeTierError。
 const BASE62_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 const SESSION_ID_PATTERN = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/
+// 同一个毫秒内允许创建的 id 数；取反后低 12 位必须落在 [0xFF0, 0xFFF]。
+const MAX_PER_MILLISECOND = 16
 
-// 前缀低 12 位编码的 counter。上游只接受 0~32（实测：32 通过、64 起 403），
-// 我们固定生成 1。
-const SESSION_COUNTER = 1n
-const SESSION_COUNTER_MAX = 32n
+let lastMillisecond = 0
+let counterInMillisecond = 0
 
 // 生成上游认可的规范 session：前 12 位是倒置时间戳，后 14 位是 base62 随机数。
-// 算法与上游 v2.5.0 的 sessionId() 一致（counter 固定 1，落在实测接受区间 0~32 内）。
+// 算法与上游 v3.0.0 的 sessionId() 一致（同毫秒内 counter 递增，落在接受区间 0~32 内）。
 // 上游 v2.5.0 已把该生成器命名为 sessionId()，这里沿用其命名以免后续同步再冲突；
 // canonicalSessionId 仅作为 fork 侧的别名保留。
 export function sessionId(timestamp = Date.now()) {
+  if (timestamp !== lastMillisecond) {
+    lastMillisecond = timestamp
+    counterInMillisecond = 0
+  }
+  const counter = counterInMillisecond++ % MAX_PER_MILLISECOND
   // 与上游 descending() 一致：value = ~(timestamp * 0x1000 + counter) 取低 48 位十六进制。
-  const value = ~(BigInt(timestamp) * 0x1000n + SESSION_COUNTER)
+  const value = ~(BigInt(timestamp) * 0x1000n + BigInt(counter))
   let time = ""
   for (let index = 0; index < 6; index += 1) {
     time += Number((value >> BigInt(40 - 8 * index)) & 0xffn)
@@ -372,65 +438,22 @@ export function canonicalSessionId(timestamp = Date.now()) {
   return sessionId(timestamp)
 }
 
-// 反解前 12 位 hex 里的 counter（低 12 位）。上游校验的就是这个值。
-function sessionCounter(sessionId) {
-  const value = BigInt(`0x${sessionId.slice(4, 16)}`)
-  return ~value & 0xffffffffffffn & 0xfffn
-}
+// 会话粒度必须是「一段对话」而不是「一个使用者」：上游按 x-opencode-session 把回合
+// 落到同一台后端，prompt cache 也只按这个 id 命中。所以这里按「使用者 + 对话种子」
+// 缓存，两段并行对话不会互相顶掉缓存（上游 v3.0.0 的做法，fork 沿用同一思路）。
 
-// 格式对还不够：counter 必须在接受区间内，否则上游同样按伪造客户端 403。
-// 所以「透传入站值」的条件是格式与 counter 双合规，否则一律重新生成。
-function isUpstreamAcceptedSession(value) {
-  return SESSION_ID_PATTERN.test(value) && sessionCounter(value) <= SESSION_COUNTER_MAX
+// 判断一个 id 是不是 OpenCode 真的可能生成出来的：形状对，且低 12 位是取反后的小序号。
+// 客户端塞进来的哈希截断或随便拼的字符串都会被上游 403。
+export function isRealSessionId(id) {
+  if (typeof id !== "string" || !SESSION_ID_PATTERN.test(id)) return false
+  const low = Number.parseInt(id.slice(13, 16), 16)
+  return Number.isInteger(low) && 0xfff - low < MAX_PER_MILLISECOND
 }
 
 // 入站会话标识的读取顺序：显式请求头 → OpenAI 标准 body 字段 → 内容派生。
-// 只要调用方（或链路上任意一跳）透传了稳定标识就按会话隔离；全部缺失时退回内容
-// 派生，避免所有调用方共用一个 session。
-const SESSION_HEADER_NAMES = ["x-opencode-session", "x-hermes-session-id"]
-
-// 种子 → 规范 session 的映射。同一会话复用同一个 session，保证上游的提示词缓存
-// 亲和稳定；种子不同则不复用。TTL 取 30 分钟，与原来的按 user 缓存一致。
-// 实测上游对时间戳新鲜度很宽松（30 天前与 1 天后的前缀都能通过），因此缓存复用
-// 生成的 session 不会因为"变旧"而失效。
-const SESSION_TTL_MS = 30 * 60 * 1000
-const MAX_SESSION_ENTRIES = 5000
-const seedSessions = new Map()
-
-function pruneSeedSessions(now) {
-  for (const [key, entry] of seedSessions) {
-    if (now - entry.at >= SESSION_TTL_MS) seedSessions.delete(key)
-    else break
-  }
-  while (seedSessions.size > MAX_SESSION_ENTRIES) {
-    seedSessions.delete(seedSessions.keys().next().value)
-  }
-}
-
-// 把任意稳定种子归一化成上游认可的 ses_<12 位倒置时间戳><14 位 base62>。
-export function deriveSessionId(seed) {
-  const value = String(seed ?? "").trim()
-  if (!value) return ""
-  // 已经是上游认可的格式且 counter 合法才直接透传；格式对但 counter 非法也会 403，
-  // 必须重新生成规范值。
-  if (isUpstreamAcceptedSession(value)) return value
-  const now = Date.now()
-  const existing = seedSessions.get(value)
-  if (existing && now - existing.at < SESSION_TTL_MS) {
-    existing.at = now
-    // 重新插入到末尾，让 Map 的迭代顺序即最近使用顺序。
-    seedSessions.delete(value)
-    seedSessions.set(value, existing)
-    return existing.id
-  }
-  const id = canonicalSessionId(now)
-  seedSessions.set(value, { id, at: now })
-  pruneSeedSessions(now)
-  return id
-}
-
+// 保留这个导出是为了兼容 fork 既有调用点与测试；新代码用 sessionSeed()。
 export function inboundSessionSeed(request, payload) {
-  for (const name of SESSION_HEADER_NAMES) {
+  for (const name of ["x-opencode-session", "x-hermes-session-id"]) {
     const value = readHeader(request, name)
     if (value) return value
   }
@@ -471,7 +494,7 @@ function contentSessionSeed(messages) {
     if (role === "system" || role === "developer") systemParts.push(stringifyContent(message?.content))
     else if (!firstUser && role === "user") firstUser = stringifyContent(message?.content)
   }
-  const seed = `${systemParts.join("\u0000")}\u0001${firstUser}`
+  const seed = `${systemParts.join("\x00")}\x01${firstUser}`
   return seed.trim().length > 1 ? seed : ""
 }
 
@@ -485,24 +508,78 @@ function stringifyContent(content) {
   }
 }
 
-// 无任何入站标识时的兜底：按使用者缓存一个规范 session，避免所有人共用一个。
-// 这里同样必须用 sessionId() —— 随机 hex 会被上游判为伪造客户端并 403。
-const userSessions = new Map()
-
-export function resolveSession(request, payload, user) {
-  const seed = inboundSessionSeed(request, payload)
-  if (seed) return deriveSessionId(seed)
-  return getSession(user)
+// 一段对话的种子。优先级从「调用方明确指定」到「从内容推断」：
+//   1. 客户端自己带的合法 x-opencode-session —— OpenCode / Claude Code 等会带；
+//   2. 调用方给的会话标识头（x-session-affinity、X-Session-Id、conversation-id，
+//      以及 Sub2API 边车可能注入的 x-hermes-session-id）；
+//   3. body 的 prompt_cache_key / metadata.user_id（Codex 的 thread、Anthropic 的 user_id）；
+//   4. system + 首条 user 内容派生 —— 多轮对话里它比末条稳定。
+// 不同来源加不同前缀，避免「客户端 id 恰好等于某个会话头」时被合并。
+export function sessionSeed(request, payload) {
+  for (const name of ["x-opencode-session", "x-opencode-session-id"]) {
+    const value = readHeader(request, name)
+    if (isRealSessionId(value)) return value
+  }
+  for (const name of ["x-hermes-session-id", "x-session-affinity", "x-session-id", "conversation-id"]) {
+    const value = readHeader(request, name)
+    if (value) return `header:${value.slice(0, 200)}`
+  }
+  const fromBody = payload && typeof payload === "object" ? payloadSessionSeed(payload) : ""
+  if (fromBody) return `cache:${fromBody.slice(0, 200)}`
+  const fromContent = contentSessionSeed(payload?.messages)
+  if (fromContent) return `first:${createHash("sha256").update(fromContent).digest("hex")}`
+  return ""
 }
 
-export function getSession(user) {
+// 对外入口：按「使用者 + 这段对话」取 session。
+// 使用者参与 seed，否则两个调用方首句相同就会共用同一份上游缓存；
+// 调用方自己给了合规 id 时原样沿用（不能被我们改掉）。
+export function sessionFor(user, request, payload) {
+  const seed = sessionSeed(request, payload)
+  if (isRealSessionId(seed)) return seed
+  return getSession(`${user || "anonymous"}\x00${seed}`)
+}
+
+// 兼容 fork 原有调用点（handler 用 resolveSession）。
+export function resolveSession(request, payload, user) {
+  return sessionFor(user, request, payload)
+}
+
+// 种子 → 规范 session 的映射。同一会话复用同一个 session，保证上游提示词缓存亲和稳定。
+// TTL 30 分钟；实测上游对时间戳新鲜度很宽松（30 天前与 1 天后都能通过），
+// 所以缓存复用不会因为"变旧"而失效。
+const SESSION_TTL_MS = 30 * 60 * 1000
+const SESSION_CACHE_LIMIT = 1000
+const sessions = new Map()
+
+// 种子已经是合规 id 时直接沿用；否则生成一个并记住。
+export function getSession(seed) {
+  const key = String(seed ?? "").trim()
+  if (!key) return ""
+  if (isRealSessionId(key)) return key
+
   const now = Date.now()
-  const existing = userSessions.get(user)
-  if (existing && now - existing.at < SESSION_TTL_MS) {
+  const existing = sessions.get(key)
+  if (existing) {
+    // 重新插入，让 Map 的迭代顺序成为最近使用顺序。
+    sessions.delete(key)
+    if (now - existing.at >= SESSION_TTL_MS) return remember(key, sessionId(now), now)
     existing.at = now
+    sessions.set(key, existing)
     return existing.id
   }
-  const id = sessionId(now)
-  userSessions.set(user, { id, at: now })
+  return remember(key, sessionId(now), now)
+}
+
+// 兼容 fork 原有调用点：把任意种子归一化成合规 id。
+export function deriveSessionId(seed) {
+  return getSession(seed)
+}
+
+function remember(seed, id, at) {
+  sessions.set(seed, { id, at })
+  while (sessions.size > SESSION_CACHE_LIMIT) {
+    sessions.delete(sessions.keys().next().value)
+  }
   return id
 }
