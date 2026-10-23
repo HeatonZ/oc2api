@@ -494,7 +494,7 @@ function contentSessionSeed(messages) {
     if (role === "system" || role === "developer") systemParts.push(stringifyContent(message?.content))
     else if (!firstUser && role === "user") firstUser = stringifyContent(message?.content)
   }
-  const seed = `${systemParts.join(" ")}${firstUser}`
+  const seed = `${systemParts.join("\x00")}\x01${firstUser}`
   return seed.trim().length > 1 ? seed : ""
 }
 
@@ -537,7 +537,7 @@ export function sessionSeed(request, payload) {
 export function sessionFor(user, request, payload) {
   const seed = sessionSeed(request, payload)
   if (isRealSessionId(seed)) return seed
-  return getSession(`${user || "anonymous"} ${seed}`)
+  return getSession(`${user || "anonymous"}\x00${seed}`)
 }
 
 // 兼容 fork 原有调用点（handler 用 resolveSession）。
