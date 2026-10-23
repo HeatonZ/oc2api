@@ -214,6 +214,29 @@ test("HTTP thinking 默认开启、none 关闭，camelCase 别名也影响真实
   }
 })
 
+test("上游拒绝 reasoning_effort=none 时去掉该字段重试一次", async (t) => {
+  const forwarded = []
+  const unsupported = JSON.stringify({
+    error: {
+      message:
+        "Upstream request failed: [invalid_request_error] Model 'mai-experimental' does not support reasoning_effort='none'; supported values: low, medium, high, xhigh.",
+      type: "invalid_request_error",
+    },
+  })
+  const server = await fixture(t, async (_url, init) => {
+    forwarded.push(JSON.parse(init.body))
+    return forwarded.length === 1 ? new Response(unsupported, { status: 400 }) : new Response(sse)
+  })
+
+  const response = await post(server.url, { ...base, stream: true, reasoningEffort: "none" })
+
+  assert.equal(response.status, 200, "降级重试后应成功")
+  assert.equal(forwarded.length, 2, "应重试一次")
+  assert.equal(forwarded[0].reasoning_effort, "none", "首次仍按客户端意图发送")
+  assert.equal(forwarded[1].reasoning_effort, undefined, "重试不再发送该字段")
+  assert.ok(!response.text.includes("reasoning_content"), "客户端仍然看不到思考内容")
+})
+
 test("多模态输入及 max_completion_tokens 原样透传", async (t) => {
   let forwarded
   const server = await fixture(t, async (_url, init) => {
