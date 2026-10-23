@@ -56,5 +56,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          # 上游 v3.0.0 起 Dockerfile 移入 docker/ 子目录（修复 Vercel 误判为容器项目），
+          # context 仍是仓库根，因为 Dockerfile 内 COPY 的是根下的 package.json 与 server/。
+          file: docker/Dockerfile
           push: true
           tags: ${{ steps.tags.outputs.tags }}
