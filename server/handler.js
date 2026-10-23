@@ -106,9 +106,9 @@ export async function chat(request, response) {
     messages: input.messages.length,
   })
 
-  // 会话标识按调用方透传的稳定标识派生，全部缺失时才退回按 user 缓存。
-  // 修复前这里恒为 getSession(request.auth.user)，而 API_KEY 为空时 user 恒为
-  // anonymous，导致所有账号、所有会话共用同一个 x-opencode-session。
+  // 会话标识按「使用者 + 这段对话」派生：入站透传头 → prompt_cache_key
+  // → system+首条 user 内容兜底。上游 v3.0.0 的 sessionFor 是同一思路，
+  // 这里保留 fork 的派生链（比上游多覆盖 Sub2API 边车注入的 x-hermes-session-id）。
   const sessionId = resolveSession(request, input, request.auth.user)
   const upstreamRequest = buildUpstreamRequest(input, sessionId)
   upstreamRequest.url = zenEndpoint("chat/completions", baseURL)
