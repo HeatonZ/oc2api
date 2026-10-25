@@ -37,4 +37,4 @@ jobs:
         run: go test ./...
 
       - name: Build (linux, 与 Vercel/Docker 一致)
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o /tmp/oc2api ./cmd/oc2api
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -o /tmp/oc2api ./cmd/oc2api

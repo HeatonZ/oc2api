@@ -16,6 +16,6 @@ mkdir -p bin public
 # Vercel 只要配了 buildCommand 就要求静态输出目录非空。这里生成一个 robots.txt，
 # 不放 index.html——否则 / 会被静态文件抢走，拿不到 /health 同构的 JSON。
 printf 'User-agent: *\nDisallow:\n' > public/robots.txt
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin/oc2api ./cmd/oc2api
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags "-s -w" -o bin/oc2api ./cmd/oc2api
 chmod +x bin/oc2api
 ls -la bin
