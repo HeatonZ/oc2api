@@ -1,6 +1,6 @@
 # AGENTS.md
 
-给维护者和 AI 看的开发细节。用户文档在 [README.md](README.md)。当前版本 `4.0.0`。
+给维护者和 AI 看的开发细节。用户文档在 [README.md](README.md)。当前版本 `4.1.0`。
 
 ## 架构
 
@@ -38,8 +38,8 @@ scripts/build-go.sh Vercel 构建期交叉编译 linux/amd64 到 bin/
 
 请求体必须同时满足，缺一项就是 429：
 
-- **system 提示词**：现在是最小版（874 字节，`internal/shape/assets/prompt.txt`），没有
-  Code Mode / 工具说明。`<env>` 块**不能整块删**（429），至少要保留
+- **system 提示词**：现在是最小版（999 字节，`internal/shape/assets/prompt.txt`），删掉了
+  Code Mode 与内置工具目录，只保留一句「只使用请求里提供的工具」。`<env>` 块**不能整块删**（429），至少要保留
   `Working directory`；`Platform`、`Is directory a git repo`、`Workspace root folder`
   都可以删（均已实测）。
 - **工作目录写 `./`**：绝对路径会让模型以为自己能访问那个目录。由 `shape.go` 的
