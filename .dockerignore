@@ -1,8 +1,13 @@
-node_modules/
 .git/
+.github/
 .vercel/
+.captures/
 .idea/
-.env
-.env.*
+.env*
 *.log
 .DS_Store
+bin/
+public/
+api/
+scripts/
+**/*_test.go
