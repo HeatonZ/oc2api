@@ -125,6 +125,14 @@ API_KEY=your-key PORT=8080 go run ./cmd/oc2api
   地址（`/<token>/opencode.<account>/https/<host>`），会被还原成
   「真实上游 + 按账号出口」，无需逐条迁移已有配置。
 
+`ZEN_API_BASE_URL` 填 `https://opencode.ai/zen/v1` 这类旧写法会被自动改写到
+`/inference/v1`；其它主机（例如自建中继）原样使用。`base_url` 查询参数不生效。
+
+同一段对话的每一轮会复用同一个上游 session，从而命中它的 prompt 缓存；换一段对话
+或换一个调用方则各自独立。会话来源逐级取：`x-opencode-session` / `x-opencode-session-id`
+→ `x-hermes-session-id`、`x-session-affinity`、`X-Session-Id`、`conversation-id`
+→ 请求体的 `prompt_cache_key` / `metadata.user_id` → 内容派生。
+
 健康检查：
 
 ```bash
@@ -187,3 +195,16 @@ golangci-lint run ./...    # lint（配置见 .golangci.yml）
 ```
 
 实现细节（为什么用 uTLS、免费层的形状要求、Vercel 为什么是薄 Node 层）见 [AGENTS.md](AGENTS.md)。
+
+联调用例会对 `big-pickle`、`mimo-v2.6-flash-free`、`deepseek-v4.1-flash-free`、`glm-5.3-flash-free` 各跑一次多轮连续工具调用（含与内置同名的客户端 `read`），真实请求上游，受免费层限流影响；未设置 `OC2API_LIVE_TEST=1` 时自动跳过。因为依赖真实模型和上游配额，它不纳入 CI 门禁，需要时本地执行。
+
+## 免费层会话标识（x-opencode-session）
+
+免费层会校验 `x-opencode-session`，**格式与语义都要对**，否则一律 `403 FreeTierError`（原文 `OpenCode's free tier can only be used from within OpenCode`）：
+
+- **格式**：`ses_` + 12 位小写 hex + 14 位 base62 字符。UUID、25 位、大写 hex 都会被拒。
+- **语义**：前 12 位 hex 按 `~(BigInt(Date.now()) * 4096n + counter)` 截断到 48 位解读，其中低 12 位编码出的毫秒内序号必须落在接受区间内。**光格式对不够**——随机 hex 或 sha256 摘要的低 12 位是任意值，绝大多数落在区间外，会被判为「非 OpenCode 客户端」而拒。v4 实测的边界比 v3 更严：序号 0 形状完全合法却仍被回 429，所以合法区间是 1 起。
+
+因此本代理对入站会话标识做归一化，逐级取种子；已经是合法 `ses_` 值（且序号合规）才原样透传，否则重新生成规范值。同一会话复用同一个 session 以保持上游提示词缓存亲和，TTL 30 分钟。
+
+上游按「一段对话」而不是「一个使用者」归并 session：同一个 id 的回合会落到同一台后端，prompt cache 也只按这个 id 命中。本代理因此把使用者与对话种子一起参与缓存键，两段并行对话不会互相顶掉缓存。

@@ -2,6 +2,8 @@
 /bin/
 /public/
 *.log
+*.tar.gz
+*.sh
 
 # 本地环境
 .env
@@ -13,5 +15,6 @@
 .DS_Store
 
 # 部署与本地产物
+node_modules/
 .vercel/
 .captures/
