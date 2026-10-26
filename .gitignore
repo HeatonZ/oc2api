@@ -1,16 +1,20 @@
-.vercel/
-node_modules/
+# 构建产物
+/bin/
+/public/
+*.log
 *.tar.gz
 *.sh
-.idea/
+
+# 本地环境
 .env
 .env.*
 !.env.example
-oc2api
-*.log
-.DS_Store
-coverage/
-.vercel
-.env*
 
-worker/dist/
+# 编辑器 / 系统
+.idea/
+.DS_Store
+
+# 部署与本地产物
+node_modules/
+.vercel/
+.captures/

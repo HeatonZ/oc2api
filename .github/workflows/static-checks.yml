@@ -12,10 +12,8 @@ on:
 permissions:
   contents: read
 
-# 只做离线检查：lint、格式、依赖审计、离线测试。
-# 真实联调（npm run test:live）刻意不放进 CI：它依赖真实模型和免费层配额，
-# 上游瞬时限流、模型偶发不服从指令都会让结果不稳定，作为门禁只会产生假警报。
-# 需要联调时本地执行 `npm run test:live`。
+# 只做离线检查：lint、单元测试、交叉编译（lint 已包含 govet，不再单独跑 vet）。
+# 真实联调刻意不放进 CI：依赖真实模型与免费层配额，上游瞬时限流会让结果不稳定。
 jobs:
   static-checks:
     runs-on: ubuntu-24.04
@@ -24,23 +22,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Setup Node.js 24
-        uses: actions/setup-node@v5
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          node-version: 24
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
+          go-version-file: go.mod
+          cache: true
 
       - name: Lint
-        run: npm run lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.15.0
 
-      - name: Check formatting
-        run: npm run format:check
+      - name: Test
+        run: go test ./...
 
-      - name: Audit dependencies
-        run: npm audit --omit=dev
-
-      - name: Run offline tests
-        run: npm test
+      - name: Build (linux, 与 Vercel/Docker 一致)
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -o /tmp/oc2api ./cmd/oc2api

@@ -1,7 +1,11 @@
 .git/
 .github/
 .idea/
+.captures/
 .env*
-node_modules/
-tests/
+*.log
+.DS_Store
 docker/
+bin/
+public/
+**/*_test.go
