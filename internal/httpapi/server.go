@@ -93,7 +93,12 @@ func authorized(cfg config.Config, r *http.Request) bool {
 }
 
 func models(w http.ResponseWriter, r *http.Request) {
-	list, err := zen.FetchModels(r.Context())
+	target, err := zen.ResolveTarget(r.Header.Get("x-opencode-base-url"), r.Header.Get("x-opencode-egress"))
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
+		return
+	}
+	list, err := zen.FetchModels(r.Context(), target)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "Upstream error: "+err.Error(), "upstream_error", "upstream_error")
 		return
@@ -133,8 +138,15 @@ func completions(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, _ := payload["stream"].(bool)
 
+	target, err := zen.ResolveTarget(r.Header.Get("x-opencode-base-url"), r.Header.Get("x-opencode-egress"))
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
+		return
+	}
+	session := zen.SessionFor(r, payload, "")
+
 	if !stream {
-		result, err := chat.Complete(r.Context(), payload, model)
+		result, err := chat.Complete(r.Context(), target, payload, model, session)
 		if err != nil {
 			var upstream *chat.UpstreamError
 			if errors.As(err, &upstream) {
@@ -152,7 +164,7 @@ func completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, renames, err := chat.Upstream(r.Context(), payload, model)
+	resp, renames, err := chat.Upstream(r.Context(), target, payload, model, session)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "Upstream error: "+err.Error(), "upstream_error", "upstream_error")
 		return

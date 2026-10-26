@@ -17,21 +17,17 @@ import (
 )
 
 // Upstream 发起一次上游对话请求（上游只接受流式，非流式由调用方聚合）。
-func Upstream(ctx context.Context, payload map[string]any, model string) (*http.Response, *shape.Renames, error) {
-	return UpstreamWithSession(ctx, payload, model, zen.SessionID())
-}
-
-// UpstreamWithSession 允许复用会话 id，多轮对话可以命中上游 prompt 缓存。
-func UpstreamWithSession(ctx context.Context, payload map[string]any, model, session string) (*http.Response, *shape.Renames, error) {
+// target 决定打到哪个上游、走哪个出口；session 由调用方按会话解析。
+func Upstream(ctx context.Context, target zen.Target, payload map[string]any, model, session string) (*http.Response, *shape.Renames, error) {
 	body, renames, err := shape.Build(payload, model)
 	if err != nil {
 		return nil, nil, err
 	}
 	debug := config.Get().Debug
 	if debug {
-		log.Printf("[chat] model=%s session=%s%s tools=%d body=%dB", model, session, describeMessages(payload), countClientTools(payload), len(body))
+		log.Printf("[chat] model=%s session=%s%s tools=%d body=%dB egress=%s base=%s", model, session, describeMessages(payload), countClientTools(payload), len(body), target.Proxy.Label(), target.Base)
 	}
-	resp, err := zen.Post(ctx, "/openai/v1/chat/completions", body, session)
+	resp, err := zen.Post(ctx, target, "v1/chat/completions", body, session)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -39,6 +35,16 @@ func UpstreamWithSession(ctx context.Context, payload map[string]any, model, ses
 		log.Printf("[chat] upstream status=%d retry-after=%s", resp.StatusCode, resp.Header.Get("Retry-After"))
 	}
 	return resp, renames, nil
+}
+
+// UpstreamWithSession 保留给已有的活体测试与调用方：
+// 按进程默认上游和出口发一次请求，显式传入 session。
+func UpstreamWithSession(ctx context.Context, payload map[string]any, model, session string) (*http.Response, *shape.Renames, error) {
+	target, err := zen.ResolveTarget("", "")
+	if err != nil {
+		return nil, nil, err
+	}
+	return Upstream(ctx, target, payload, model, session)
 }
 
 // describeMessages 汇总消息角色，便于在日志里还原客户端请求形态。
@@ -81,8 +87,8 @@ func Validate(payload map[string]any) (model string, reason string) {
 const noToolRetry = "（本客户端没有可用的工具，请直接用文字回答，不要调用任何工具。）"
 
 // Complete 返回聚合后的非流式响应。
-func Complete(ctx context.Context, payload map[string]any, model string) (map[string]any, error) {
-	resp, renames, err := Upstream(ctx, payload, model)
+func Complete(ctx context.Context, target zen.Target, payload map[string]any, model, session string) (map[string]any, error) {
+	resp, renames, err := Upstream(ctx, target, payload, model, session)
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +106,7 @@ func Complete(ctx context.Context, payload map[string]any, model string) (map[st
 	}
 
 	retryPayload := withNudge(payload)
-	resp2, renames2, err := Upstream(ctx, retryPayload, model)
+	resp2, renames2, err := Upstream(ctx, target, retryPayload, model, session)
 	if err != nil {
 		return result, nil
 	}

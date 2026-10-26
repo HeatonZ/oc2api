@@ -17,6 +17,7 @@ import (
 
 	"oc2api/internal/chat"
 	"oc2api/internal/config"
+	"oc2api/internal/dial"
 	"oc2api/internal/ipinfo"
 	"oc2api/internal/protocol"
 	"oc2api/internal/zen"
@@ -64,7 +65,7 @@ func Handle(ctx context.Context, raw []byte, emit emitter) {
 			"endpoints": endpointList,
 		})
 	case "models":
-		list, err := zen.FetchModels(ctx)
+		list, err := zen.FetchModels(ctx, zen.Target{Base: mustBase(), Proxy: dial.DefaultProxy()})
 		if err != nil {
 			emitError(emit, req.ID, -32000, err.Error())
 			return
@@ -85,8 +86,13 @@ func Handle(ctx context.Context, raw []byte, emit emitter) {
 }
 
 type chatParams struct {
-	Body   json.RawMessage `json:"body"`
-	Stream bool            `json:"stream"`
+	Body json.RawMessage `json:"body"`
+	// 流式与否以 body 里的 stream 为准；这里只为兼容旧调用方保留字段。
+	Stream bool `json:"stream"`
+	// Vercel 薄层转发的请求级覆盖，语义与 HTTP 头一致。
+	BaseURL string `json:"baseURL"`
+	Egress  string `json:"egress"`
+	Session string `json:"session"`
 }
 
 func handleChat(ctx context.Context, req request, emit emitter) {
@@ -109,8 +115,20 @@ func handleChat(ctx context.Context, req request, emit emitter) {
 		return
 	}
 
-	if !params.Stream {
-		result, err := chat.Complete(ctx, payload, model)
+	target, err := zen.ResolveTarget(params.BaseURL, params.Egress)
+	if err != nil {
+		emitError(emit, req.ID, -32602, err.Error())
+		return
+	}
+	// 调用方指定了合规 session 就沿用，否则按内容派生，保证缓存亲和。
+	session := params.Session
+	if !zen.IsRealSessionID(session) {
+		session = zen.SessionForID(params.Session, payload)
+	}
+
+	stream, _ := payload["stream"].(bool)
+	if !stream {
+		result, err := chat.Complete(ctx, target, payload, model, session)
 		if err != nil {
 			var upstream *chat.UpstreamError
 			if errors.As(err, &upstream) {
@@ -128,7 +146,7 @@ func handleChat(ctx context.Context, req request, emit emitter) {
 		return
 	}
 
-	resp, renames, err := chat.Upstream(ctx, payload, model)
+	resp, renames, err := chat.Upstream(ctx, target, payload, model, session)
 	if err != nil {
 		emitError(emit, req.ID, -32000, err.Error())
 		return
@@ -257,4 +275,13 @@ func ServeStdio() error {
 	}
 	wg.Wait()
 	return scanner.Err()
+}
+
+// mustBase 给不带请求上下文的端点（models）取进程级上游基址。
+func mustBase() string {
+	base, err := zen.ResolveBase("")
+	if err != nil {
+		return zen.UpstreamBase
+	}
+	return base
 }

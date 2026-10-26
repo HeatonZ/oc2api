@@ -16,6 +16,8 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+
+	"oc2api/internal/dial"
 )
 
 const (
@@ -65,44 +67,58 @@ func bunClientHello() *utls.ClientHelloSpec {
 
 var (
 	clientOnce sync.Once
-	client     *http.Client
+	// 每个出口代理一个 client：连接池按代理隔离，否则 A 出口的连接会被 B 复用，
+	// 出口就串了。
+	clientsMu sync.Mutex
+	clients   = map[string]*http.Client{}
 )
 
 // Client 返回带 Bun 指纹的 HTTP 客户端（连接复用，握手按连接做一次）。
-func Client() *http.Client {
-	clientOnce.Do(func() {
-		transport := &http.Transport{
-			ForceAttemptHTTP2:     false,
-			MaxIdleConnsPerHost:   32,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 90 * time.Second,
-			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				host, _, err := net.SplitHostPort(addr)
-				if err != nil {
-					host = addr
-				}
-				dialer := &net.Dialer{Timeout: 10 * time.Second}
-				conn, err := dialer.DialContext(ctx, "tcp", addr)
-				if err != nil {
-					return nil, err
-				}
-				tlsConn := utls.UClient(conn, &utls.Config{ServerName: host}, utls.HelloCustom)
-				if err := tlsConn.ApplyPreset(bunClientHello()); err != nil {
-					_ = conn.Close()
-					return nil, err
-				}
-				if err := tlsConn.HandshakeContext(ctx); err != nil {
-					_ = conn.Close()
-					return nil, err
-				}
-				return tlsConn, nil
-			},
-		}
-		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-		client = &http.Client{Transport: transport, Timeout: 0}
-	})
-	return client
+// 不同出口各自一份，保证连接池不会跨出口复用。
+func Client(proxy dial.Proxy) *http.Client {
+	key := proxy.URL
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+	if existing, ok := clients[key]; ok {
+		return existing
+	}
+	created := newClient(proxy)
+	clients[key] = created
+	return created
+}
+
+func newClient(proxy dial.Proxy) *http.Client {
+	transport := &http.Transport{
+		ForceAttemptHTTP2:     false,
+		MaxIdleConnsPerHost:   32,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 90 * time.Second,
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, _, err := net.SplitHostPort(addr)
+			if err != nil {
+				host = addr
+			}
+			// 关键顺序：先经代理打通 TCP（CONNECT），再在这个字节流上做 uTLS
+			// 握手。反过来的话握手就发生在代理之外，指纹到不了上游。
+			conn, err := dial.Dial(ctx, proxy, addr)
+			if err != nil {
+				return nil, err
+			}
+			tlsConn := utls.UClient(conn, &utls.Config{ServerName: host}, utls.HelloCustom)
+			if err := tlsConn.ApplyPreset(bunClientHello()); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				_ = conn.Close()
+				return nil, err
+			}
+			return tlsConn, nil
+		},
+	}
+	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	return &http.Client{Transport: transport, Timeout: 0}
 }
 
 // Base 返回上游地址，允许 ZEN_API_BASE_URL 覆盖（默认免费层 inference 入口）。
@@ -117,22 +133,22 @@ func Base() string {
 const idChars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 var (
-	sessionMu    sync.Mutex
-	sessionLast  int64
-	sessionCount uint64
+	idMu    sync.Mutex
+	idLast  int64
+	idCount uint64
 )
 
 func SessionID() string {
-	sessionMu.Lock()
+	idMu.Lock()
 	now := time.Now().UnixMilli()
-	if now != sessionLast {
-		sessionLast = now
-		sessionCount = 0
+	if now != idLast {
+		idLast = now
+		idCount = 0
 	}
 	// 上游只接受 1..15 的毫秒内序号：序号 0 会把低 12 位填成 0xFFF，实测被判 429。
-	counter := sessionCount%15 + 1
-	sessionCount++
-	sessionMu.Unlock()
+	counter := idCount%15 + 1
+	idCount++
+	idMu.Unlock()
 
 	value := ^(uint64(now)*0x1000 + counter)
 	var b strings.Builder
@@ -175,28 +191,28 @@ func randomHex(n int) string {
 	return hex.EncodeToString(buf)
 }
 
-// Post 用 Bun 指纹把请求发到上游。
-func Post(ctx context.Context, path string, body []byte, session string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, Base()+path, strings.NewReader(string(body)))
+// Post 用 Bun 指纹把请求发到上游。target 里的 Base 和 Proxy 已按请求解析好。
+func Post(ctx context.Context, target Target, path string, body []byte, session string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, Endpoint(target.Base, path), strings.NewReader(string(body)))
 	if err != nil {
 		return nil, err
 	}
 	for key, value := range UpstreamHeaders(session) {
 		req.Header.Set(key, value)
 	}
-	return Client().Do(req)
+	return Client(target.Proxy).Do(req)
 }
 
 // FetchModels 拉取上游模型列表并只保留免费模型。
-func FetchModels(ctx context.Context) ([]map[string]any, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, Base()+"/v1/models", nil)
+func FetchModels(ctx context.Context, target Target) ([]map[string]any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, Endpoint(target.Base, "v1/models"), nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer public")
 	req.Header.Set("User-Agent", clientUA)
-	res, err := Client().Do(req)
+	res, err := Client(target.Proxy).Do(req)
 	if err != nil {
 		return nil, err
 	}
