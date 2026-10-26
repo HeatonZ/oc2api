@@ -19,8 +19,6 @@ type Target struct {
 // 上游路径的两种拼法，和 v3 保持一致：
 // 基址已经指到版本路径（.../inference/v1、.../zen/v1、.../v1）时直接拼相对路径，
 // 否则补上 /inference/v1。
-const zenAPIPath = "/inference/v1"
-
 var versionPathSuffixes = []string{"/inference/v1", "/zen/v1", "/v1"}
 
 // normalizeZenBase 把 opencode.ai 上的 /zen* 改写成 /inference*。

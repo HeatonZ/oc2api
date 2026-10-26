@@ -66,7 +66,6 @@ func bunClientHello() *utls.ClientHelloSpec {
 }
 
 var (
-	clientOnce sync.Once
 	// 每个出口代理一个 client：连接池按代理隔离，否则 A 出口的连接会被 B 复用，
 	// 出口就串了。
 	clientsMu sync.Mutex
