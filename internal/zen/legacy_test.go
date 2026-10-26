@@ -3,6 +3,8 @@ package zen
 import (
 	"strings"
 	"testing"
+
+	"oc2api/internal/config"
 )
 
 // 现存 Sub2API 账号里存的是 v3 的反向代理地址。v4 必须能从这种地址里
@@ -64,14 +66,13 @@ func TestParseLegacyRelay(t *testing.T) {
 
 // 旧地址必须被解析成「真实目标 + 按账号的 egress」，而不是继续走反代。
 func TestResolveTargetFromLegacyRelay(t *testing.T) {
-	t.Setenv("OC2API_EGRESS_URL", "socks5://egress-filter:1080")
-	t.Setenv("OC2API_EGRESS_PASS", "pw")
-	t.Setenv("OC2API_EGRESS_USER", "")
-	t.Setenv("OC2API_PROXY", "")
-	t.Setenv("HTTPS_PROXY", "")
-	t.Setenv("https_proxy", "")
+	factory := NewFactory(config.Config{
+		EgressURL:  "socks5://egress-filter:1080",
+		EgressUser: "opencode.{account}",
+		EgressPass: "pw",
+	})
 
-	target, err := ResolveTarget(
+	target, err := factory.Resolve(
 		"http://resin:2260/11123zzzsf/opencode.freeproxy7/https/opencode.ai",
 		"",
 	)
@@ -94,10 +95,13 @@ func TestResolveTargetFromLegacyRelay(t *testing.T) {
 
 // 显式请求头 x-opencode-egress 必须压过旧地址推导出来的出口。
 func TestEgressHeaderWinsOverLegacy(t *testing.T) {
-	t.Setenv("OC2API_EGRESS_URL", "socks5://egress-filter:1080")
-	t.Setenv("OC2API_EGRESS_PASS", "pw")
+	factory := NewFactory(config.Config{
+		EgressURL:  "socks5://egress-filter:1080",
+		EgressUser: "opencode.{account}",
+		EgressPass: "pw",
+	})
 
-	target, err := ResolveTarget(
+	target, err := factory.Resolve(
 		"http://resin:2260/tok/opencode.freeproxy7/https/opencode.ai",
 		"socks5://opencode.freeproxy99:pw2@other-egress:1080",
 	)
@@ -112,13 +116,9 @@ func TestEgressHeaderWinsOverLegacy(t *testing.T) {
 // 没有配 egress 时不能悄悄退回反代，必须落到直连（并暴露问题），
 // 否则会以「看似成功」的方式丢掉按账号轮转。
 func TestNoEgressFallsBackToDirect(t *testing.T) {
-	t.Setenv("OC2API_EGRESS_URL", "")
-	t.Setenv("OC2API_EGRESS_PASS", "")
-	t.Setenv("OC2API_PROXY", "")
-	t.Setenv("HTTPS_PROXY", "")
-	t.Setenv("https_proxy", "")
+	factory := NewFactory(config.Config{})
 
-	target, err := ResolveTarget(
+	target, err := factory.Resolve(
 		"http://resin:2260/tok/opencode.freeproxy7/https/opencode.ai",
 		"",
 	)

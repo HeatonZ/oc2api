@@ -111,13 +111,13 @@ func TestSessionSeparatesUsers(t *testing.T) {
 
 func TestSessionCacheBounded(t *testing.T) {
 	// 灌超上限的种子，缓存不能无限增长。
-	for i := 0; i < sessionLimit+50; i++ {
+	for i := 0; i < cacheLimit+50; i++ {
 		sessionForSeed("seed-" + strings.Repeat("x", 1) + string(rune('a'+i%26)) + string(rune('a'+i/26)))
 	}
-	sessionMu.Lock()
-	size := len(sessionMap)
-	sessionMu.Unlock()
-	if size > sessionLimit {
-		t.Fatalf("会话缓存超过上限: %d > %d", size, sessionLimit)
+	cacheMu.Lock()
+	size := len(cacheMap)
+	cacheMu.Unlock()
+	if size > cacheLimit {
+		t.Fatalf("会话缓存超过上限: %d > %d", size, cacheLimit)
 	}
 }

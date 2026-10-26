@@ -9,42 +9,51 @@ import (
 	"strings"
 
 	"oc2api/internal/config"
-
 	"oc2api/internal/protocol"
-
 	"oc2api/internal/shape"
 	"oc2api/internal/zen"
 )
 
+// Service 持有一次对话需要的依赖，由 main 注入。
+type Service struct {
+	client  *zen.Client
+	targets *zen.Factory
+	debug   bool
+}
+
+// New 注入上游客户端、请求级目标解析器与调试开关。
+func New(cfg config.Config, client *zen.Client, targets *zen.Factory) *Service {
+	return &Service{client: client, targets: targets, debug: cfg.Debug}
+}
+
 // Upstream 发起一次上游对话请求（上游只接受流式，非流式由调用方聚合）。
-// target 决定打到哪个上游、走哪个出口；session 由调用方按会话解析。
-func Upstream(ctx context.Context, target zen.Target, payload map[string]any, model, session string) (*http.Response, *shape.Renames, error) {
+// baseOverride / egressOverride 是请求头带来的按请求覆盖，空串表示用默认。
+func (s *Service) Upstream(ctx context.Context, payload map[string]any, model, baseOverride, egressOverride string) (*http.Response, *shape.Renames, error) {
+	return s.UpstreamWithSession(ctx, payload, model, baseOverride, egressOverride, zen.SessionID())
+}
+
+// UpstreamWithSession 允许复用会话 id，多轮对话可以命中上游 prompt 缓存。
+// target 按本次请求的覆盖值解析，不固定在进程级——每个账号各走自己的出口。
+func (s *Service) UpstreamWithSession(ctx context.Context, payload map[string]any, model, baseOverride, egressOverride, session string) (*http.Response, *shape.Renames, error) {
+	target, err := s.targets.Resolve(baseOverride, egressOverride)
+	if err != nil {
+		return nil, nil, err
+	}
 	body, renames, err := shape.Build(payload, model)
 	if err != nil {
 		return nil, nil, err
 	}
-	debug := config.Get().Debug
-	if debug {
+	if s.debug {
 		log.Printf("[chat] model=%s session=%s%s tools=%d body=%dB egress=%s base=%s", model, session, describeMessages(payload), countClientTools(payload), len(body), target.Proxy.Label(), target.Base)
 	}
-	resp, err := zen.Post(ctx, target, "v1/chat/completions", body, session)
+	resp, err := s.client.Chat(ctx, target, body, session)
 	if err != nil {
 		return nil, nil, err
 	}
-	if debug {
+	if s.debug {
 		log.Printf("[chat] upstream status=%d retry-after=%s", resp.StatusCode, resp.Header.Get("Retry-After"))
 	}
 	return resp, renames, nil
-}
-
-// UpstreamWithSession 保留给已有的活体测试与调用方：
-// 按进程默认上游和出口发一次请求，显式传入 session。
-func UpstreamWithSession(ctx context.Context, payload map[string]any, model, session string) (*http.Response, *shape.Renames, error) {
-	target, err := zen.ResolveTarget("", "")
-	if err != nil {
-		return nil, nil, err
-	}
-	return Upstream(ctx, target, payload, model, session)
 }
 
 // describeMessages 汇总消息角色，便于在日志里还原客户端请求形态。
@@ -87,8 +96,14 @@ func Validate(payload map[string]any) (model string, reason string) {
 const noToolRetry = "（本客户端没有可用的工具，请直接用文字回答，不要调用任何工具。）"
 
 // Complete 返回聚合后的非流式响应。
-func Complete(ctx context.Context, target zen.Target, payload map[string]any, model, session string) (map[string]any, error) {
-	resp, renames, err := Upstream(ctx, target, payload, model, session)
+func (s *Service) Complete(ctx context.Context, payload map[string]any, model, baseOverride, egressOverride string) (map[string]any, error) {
+	return s.CompleteWithSession(ctx, payload, model, baseOverride, egressOverride, zen.SessionID())
+}
+
+// CompleteWithSession 是 Complete 的会话显式版：同一段对话复用同一个 session，
+// 上游才会命中提示词缓存。
+func (s *Service) CompleteWithSession(ctx context.Context, payload map[string]any, model, baseOverride, egressOverride, session string) (map[string]any, error) {
+	resp, renames, err := s.UpstreamWithSession(ctx, payload, model, baseOverride, egressOverride, session)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +121,7 @@ func Complete(ctx context.Context, target zen.Target, payload map[string]any, mo
 	}
 
 	retryPayload := withNudge(payload)
-	resp2, renames2, err := Upstream(ctx, target, retryPayload, model, session)
+	resp2, renames2, err := s.UpstreamWithSession(ctx, retryPayload, model, baseOverride, egressOverride, session)
 	if err != nil {
 		return result, nil
 	}

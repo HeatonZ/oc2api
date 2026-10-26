@@ -147,7 +147,7 @@ func fetchThrough(t *testing.T, proxy dial.Proxy, addr string) {
 	if err != nil {
 		t.Fatalf("构造请求失败: %v", err)
 	}
-	resp, err := Client(proxy).Do(req)
+	resp, err := newTransport(5*time.Second, proxy).RoundTrip(req)
 	if err == nil {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
