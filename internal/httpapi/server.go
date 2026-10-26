@@ -38,9 +38,9 @@ func writeOpenAIError(w http.ResponseWriter, status int, message, kind, code str
 	writeJSON(w, status, map[string]any{"error": body}, nil)
 }
 
-// Server 组装路由：/ 与 /health 公开，其余按 API_KEY 鉴权。
-func Server() http.Handler {
-	cfg := config.Get()
+// New 组装路由：/ 与 /health 公开，其余按 API_KEY 鉴权。
+// 配置与上游客户端都由 main 注入，这里不再读环境变量。
+func New(cfg config.Config, client *zen.Client, targets *zen.Factory, chats *chat.Service) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", withCORS(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -53,13 +53,13 @@ func Server() http.Handler {
 				writeOpenAIError(w, http.StatusUnauthorized, "Invalid API key", "authentication_error", "")
 				return
 			}
-			models(w, r)
+			models(w, r, client, targets)
 		case "/v1/chat/completions", "/chat/completions":
 			if !authorized(cfg, r) {
 				writeOpenAIError(w, http.StatusUnauthorized, "Invalid API key", "authentication_error", "")
 				return
 			}
-			completions(w, r)
+			completions(w, r, targets, chats)
 		default:
 			writeOpenAIError(w, http.StatusNotFound, "Not found", "invalid_request_error", "")
 		}
@@ -92,13 +92,13 @@ func authorized(cfg config.Config, r *http.Request) bool {
 	return token == cfg.APIKey
 }
 
-func models(w http.ResponseWriter, r *http.Request) {
-	target, err := zen.ResolveTarget(r.Header.Get("x-opencode-base-url"), r.Header.Get("x-opencode-egress"))
+func models(w http.ResponseWriter, r *http.Request, client *zen.Client, targets *zen.Factory) {
+	target, err := targets.Resolve(r.Header.Get("x-opencode-base-url"), r.Header.Get("x-opencode-egress"))
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 		return
 	}
-	list, err := zen.FetchModels(r.Context(), target)
+	list, err := client.Models(r.Context(), target)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "Upstream error: "+err.Error(), "upstream_error", "upstream_error")
 		return
@@ -116,7 +116,7 @@ func ip(w http.ResponseWriter) {
 	writeJSON(w, http.StatusOK, map[string]any{"ip": found, "source": source}, nil)
 }
 
-func completions(w http.ResponseWriter, r *http.Request) {
+func completions(w http.ResponseWriter, r *http.Request, targets *zen.Factory, chats *chat.Service) {
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "Not found", "invalid_request_error", "")
 		return
@@ -138,15 +138,18 @@ func completions(w http.ResponseWriter, r *http.Request) {
 	}
 	stream, _ := payload["stream"].(bool)
 
-	target, err := zen.ResolveTarget(r.Header.Get("x-opencode-base-url"), r.Header.Get("x-opencode-egress"))
-	if err != nil {
+	baseURL := r.Header.Get("x-opencode-base-url")
+	egress := r.Header.Get("x-opencode-egress")
+	// 请求头的合法性在入口就判 400：等到 chat 里解析会变成 502，
+	// 让调用方以为上游挂了，实际是自己给的地址不合规。
+	if _, err := targets.Resolve(baseURL, egress); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "")
 		return
 	}
 	session := zen.SessionFor(r, payload, "")
 
 	if !stream {
-		result, err := chat.Complete(r.Context(), target, payload, model, session)
+		result, err := chats.CompleteWithSession(r.Context(), payload, model, baseURL, egress, session)
 		if err != nil {
 			var upstream *chat.UpstreamError
 			if errors.As(err, &upstream) {
@@ -164,7 +167,7 @@ func completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, renames, err := chat.Upstream(r.Context(), target, payload, model, session)
+	resp, renames, err := chats.UpstreamWithSession(r.Context(), payload, model, baseURL, egress, session)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "Upstream error: "+err.Error(), "upstream_error", "upstream_error")
 		return

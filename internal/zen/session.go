@@ -137,18 +137,18 @@ func truncate(value string, limit int) string {
 
 // 种子 → 规范 session 的映射。同一会话复用同一个 session，上游提示词缓存亲和才稳。
 const (
-	sessionTTL   = 30 * time.Minute
-	sessionLimit = 1000
+	cacheTTL   = 30 * time.Minute
+	cacheLimit = 1000
 )
 
-type sessionEntry struct {
+type cacheEntry struct {
 	id string
 	at time.Time
 }
 
 var (
-	sessionMu  sync.Mutex
-	sessionMap = map[string]*sessionEntry{}
+	cacheMu  sync.Mutex
+	cacheMap = map[string]*cacheEntry{}
 )
 
 // SessionFor 按「使用者 + 这段对话」取 session。
@@ -184,28 +184,28 @@ func sessionForSeed(seed string) string {
 	}
 
 	now := time.Now()
-	sessionMu.Lock()
-	defer sessionMu.Unlock()
-	if existing, ok := sessionMap[key]; ok {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+	if existing, ok := cacheMap[key]; ok {
 		// 先判过期再刷新时间，否则刚赋值就成了「零间隔」，永远不会过期。
-		stale := now.Sub(existing.at) >= sessionTTL
+		stale := now.Sub(existing.at) >= cacheTTL
 		existing.at = now
 		if stale {
 			existing.id = SessionID()
 		}
 		return existing.id
 	}
-	entry := &sessionEntry{id: SessionID(), at: now}
-	sessionMap[key] = entry
-	for len(sessionMap) > sessionLimit {
+	entry := &cacheEntry{id: SessionID(), at: now}
+	cacheMap[key] = entry
+	for len(cacheMap) > cacheLimit {
 		oldestKey := ""
 		var oldest time.Time
-		for candidate, value := range sessionMap {
+		for candidate, value := range cacheMap {
 			if oldestKey == "" || value.at.Before(oldest) {
 				oldestKey, oldest = candidate, value.at
 			}
 		}
-		delete(sessionMap, oldestKey)
+		delete(cacheMap, oldestKey)
 	}
 	return entry.id
 }

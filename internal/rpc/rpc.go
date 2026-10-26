@@ -17,7 +17,6 @@ import (
 
 	"oc2api/internal/chat"
 	"oc2api/internal/config"
-	"oc2api/internal/dial"
 	"oc2api/internal/ipinfo"
 	"oc2api/internal/protocol"
 	"oc2api/internal/zen"
@@ -38,6 +37,19 @@ type request struct {
 
 type emitter func(msg map[string]any)
 
+// Handler 持有 RPC 需要的依赖，由 main 注入。
+type Handler struct {
+	cfg     config.Config
+	client  *zen.Client
+	targets *zen.Factory
+	chat    *chat.Service
+}
+
+// New 注入配置、上游客户端与对话服务。
+func New(cfg config.Config, client *zen.Client, targets *zen.Factory, chats *chat.Service) *Handler {
+	return &Handler{cfg: cfg, client: client, targets: targets, chat: chats}
+}
+
 func emitResult(emit emitter, id any, result any) {
 	emit(map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
 }
@@ -51,7 +63,7 @@ func emitNotify(emit emitter, id any, method string, params any) {
 }
 
 // Handle 处理一条 JSON-RPC 请求，把结果/通知交给 emit。
-func Handle(ctx context.Context, raw []byte, emit emitter) {
+func (h *Handler) Handle(ctx context.Context, raw []byte, emit emitter) {
 	var req request
 	if err := json.Unmarshal(raw, &req); err != nil {
 		emitError(emit, nil, -32700, "parse error")
@@ -65,7 +77,12 @@ func Handle(ctx context.Context, raw []byte, emit emitter) {
 			"endpoints": endpointList,
 		})
 	case "models":
-		list, err := zen.FetchModels(ctx, zen.Target{Base: mustBase(), Proxy: dial.DefaultProxy()})
+		target, err := h.targets.Resolve("", "")
+		if err != nil {
+			emitError(emit, req.ID, -32000, err.Error())
+			return
+		}
+		list, err := h.client.Models(ctx, target)
 		if err != nil {
 			emitError(emit, req.ID, -32000, err.Error())
 			return
@@ -79,7 +96,7 @@ func Handle(ctx context.Context, raw []byte, emit emitter) {
 		}
 		emitResult(emit, req.ID, map[string]any{"ip": found, "source": source})
 	case "chat":
-		handleChat(ctx, req, emit)
+		h.handleChat(ctx, req, emit)
 	default:
 		emitError(emit, req.ID, -32601, "method not found")
 	}
@@ -95,7 +112,7 @@ type chatParams struct {
 	Session string `json:"session"`
 }
 
-func handleChat(ctx context.Context, req request, emit emitter) {
+func (h *Handler) handleChat(ctx context.Context, req request, emit emitter) {
 	var params chatParams
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		emitError(emit, req.ID, -32602, "invalid params")
@@ -115,11 +132,6 @@ func handleChat(ctx context.Context, req request, emit emitter) {
 		return
 	}
 
-	target, err := zen.ResolveTarget(params.BaseURL, params.Egress)
-	if err != nil {
-		emitError(emit, req.ID, -32602, err.Error())
-		return
-	}
 	// 调用方指定了合规 session 就沿用，否则按内容派生，保证缓存亲和。
 	session := params.Session
 	if !zen.IsRealSessionID(session) {
@@ -128,7 +140,7 @@ func handleChat(ctx context.Context, req request, emit emitter) {
 
 	stream, _ := payload["stream"].(bool)
 	if !stream {
-		result, err := chat.Complete(ctx, target, payload, model, session)
+		result, err := h.chat.CompleteWithSession(ctx, payload, model, params.BaseURL, params.Egress, session)
 		if err != nil {
 			var upstream *chat.UpstreamError
 			if errors.As(err, &upstream) {
@@ -146,7 +158,7 @@ func handleChat(ctx context.Context, req request, emit emitter) {
 		return
 	}
 
-	resp, renames, err := chat.Upstream(ctx, target, payload, model, session)
+	resp, renames, err := h.chat.UpstreamWithSession(ctx, payload, model, params.BaseURL, params.Egress, session)
 	if err != nil {
 		emitError(emit, req.ID, -32000, err.Error())
 		return
@@ -165,7 +177,7 @@ func handleChat(ctx context.Context, req request, emit emitter) {
 
 	writer := &emitWriter{emit: emit, id: req.ID}
 	err = protocol.Stream(writer, resp, renames)
-	if config.Get().Debug {
+	if h.cfg.Debug {
 		log.Printf("[rpc] stream done model=%s bytes=%d content=%dB finish=%q calls=%v err=%v", model, writer.bytes, writer.content, writer.finish, writer.calls, err)
 	}
 	if err != nil {
@@ -249,7 +261,7 @@ func (e *emitWriter) track(frame string) {
 
 // ServeStdio 从 stdin 读 NDJSON 请求，逐条处理；每条一个 goroutine，
 // 输出用互斥锁串行化，避免不同请求的消息交错。
-func ServeStdio() error {
+func (h *Handler) ServeStdio() error {
 	encoder := json.NewEncoder(os.Stdout)
 	var mu sync.Mutex
 	emit := func(msg map[string]any) {
@@ -270,18 +282,9 @@ func ServeStdio() error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			Handle(context.Background(), raw, emit)
+			h.Handle(context.Background(), raw, emit)
 		}()
 	}
 	wg.Wait()
 	return scanner.Err()
-}
-
-// mustBase 给不带请求上下文的端点（models）取进程级上游基址。
-func mustBase() string {
-	base, err := zen.ResolveBase("")
-	if err != nil {
-		return zen.UpstreamBase
-	}
-	return base
 }
