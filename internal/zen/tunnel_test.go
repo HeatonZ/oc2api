@@ -51,7 +51,7 @@ func tlsUpstream(t *testing.T) (addr string, captured *[]capturedHello) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				hello, raw, err := readClientHelloRecord(c)
 				if err != nil {
 					return
@@ -101,7 +101,7 @@ func recordingProxy(t *testing.T) (addr string, targets *[]string) {
 				return
 			}
 			go func(c net.Conn) {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				reader := bufio.NewReader(c)
 				line, err := reader.ReadString('\n')
 				if err != nil {
@@ -127,7 +127,7 @@ func recordingProxy(t *testing.T) (addr string, targets *[]string) {
 					_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 					return
 				}
-				defer upstream.Close()
+				defer func() { _ = upstream.Close() }()
 				if _, err := c.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 					return
 				}

@@ -39,7 +39,7 @@ func socks5Recorder(t *testing.T) (addr string, users *[]string, targets *[]stri
 }
 
 func serveSOCKS5(c net.Conn, users *[]string, targets *[]string) {
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	br := bufio.NewReader(c)
 
 	head := make([]byte, 2)
@@ -137,13 +137,13 @@ func TestSOCKS5RejectsBadAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("监听失败: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		buf := make([]byte, 64)
 		_, _ = conn.Read(buf)
 		_, _ = conn.Write([]byte{0x05, 0x02})
@@ -163,14 +163,14 @@ func TestHTTPConnectCarriesBasicAuth(t *testing.T) {
 	if err != nil {
 		t.Fatalf("监听失败: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	gotAuth := make(chan string, 1)
 	go func() {
 		conn, err := listener.Accept()
 		if err != nil {
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		br := bufio.NewReader(conn)
 		for {
 			line, err := br.ReadString('\n')
