@@ -112,6 +112,19 @@ API_KEY=your-key PORT=8080 go run ./cmd/oc2api
 - `ZEN_CONNECT_TIMEOUT_MS`：建连超时，默认 600000 毫秒
 - `DEBUG`：设为 `true` 输出调试日志
 
+出口与请求级覆盖（fork 定制）：
+
+- `OC2API_EGRESS_URL`：出口隧道入口，例如 `socks5://egress-filter:1080`。
+  必须是 CONNECT 类隧道（SOCKS5 或 HTTP CONNECT）；反向代理会终结 TLS，
+  把免费层赖以识别的客户端指纹替换成中间层的，等于让 uTLS 失效。
+- `OC2API_EGRESS_USER`：出口鉴权用户名模板，默认 `opencode.{account}`。
+  `{account}` 会被替换成请求所带的租约名，用于按账号绑定出口。
+- `OC2API_EGRESS_PASS`：出口鉴权密码。
+- 请求头 `x-opencode-egress`：按请求指定完整出口地址，优先级最高。
+- 请求头 `x-opencode-base-url`：按请求覆盖上游地址。若传入的是旧版反向代理
+  地址（`/<token>/opencode.<account>/https/<host>`），会被还原成
+  「真实上游 + 按账号出口」，无需逐条迁移已有配置。
+
 健康检查：
 
 ```bash
