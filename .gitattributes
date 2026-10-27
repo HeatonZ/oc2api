@@ -1,0 +1,2 @@
+* text=auto eol=lf
+scripts/build-go.sh text eol=lf

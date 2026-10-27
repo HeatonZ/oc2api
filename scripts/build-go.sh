@@ -13,8 +13,9 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 
 mkdir -p bin public
-# Vercel 只要配了 buildCommand 就要求静态输出目录非空。这里生成一个 robots.txt，
-# 不放 index.html——否则 / 会被静态文件抢走，拿不到 /health 同构的 JSON。
+# 根目录没有 package.json 但有 buildCommand，Vercel 会用 @vercel/static-build 处理根目录，
+# 它的 validateDistDir 要求 outputDirectory（这里 public）存在且非空，否则构建直接失败。
+# 只用 robots.txt 占位，不放 index.html——静态文件优先于 rewrites，会抢走 /。
 printf 'User-agent: *\nDisallow:\n' > public/robots.txt
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags "-s -w" -o bin/oc2api ./cmd/oc2api
 chmod +x bin/oc2api
