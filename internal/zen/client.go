@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,7 +21,7 @@ import (
 )
 
 const (
-	clientUA  = "opencode/latest/2.1.4/cli"
+	clientUA  = "opencode/latest/2.1.1/cli"
 	projectID = "3f3f7816fd9ceeaf0c3df15f6048b06b7f4e1787"
 
 	// 上游接口路径集中在这两行：ZEN_API_BASE_URL 只给站点根，
@@ -249,14 +248,11 @@ func SessionID() string {
 func UpstreamHeaders(session string) map[string]string {
 	// 只做免费层：固定使用公共匿名标识。
 	const token = "public"
-	trace, span := randomHex(16), randomHex(8)
 	return map[string]string{
 		"Content-Type":          "application/json",
 		"Authorization":         "Bearer " + token,
 		"User-Agent":            clientUA,
 		"Accept":                "*/*",
-		"b3":                    trace + "-" + span + "-1-" + randomHex(8),
-		"traceparent":           "00-" + trace + "-" + span + "-01",
 		"x-opencode-client":     "cli",
 		"x-opencode-project":    projectID,
 		"x-opencode-session":    session,
@@ -264,10 +260,4 @@ func UpstreamHeaders(session string) map[string]string {
 		"x-session-affinity":    session,
 		"X-Session-Id":          session,
 	}
-}
-
-func randomHex(n int) string {
-	buf := make([]byte, n)
-	_, _ = rand.Read(buf)
-	return hex.EncodeToString(buf)
 }
