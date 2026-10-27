@@ -1,7 +1,6 @@
 # AGENTS.md
 
-给维护者和 AI 看的开发细节。用户文档在 [README.md](README.md)。版本号只在
-`internal/config` 的 `Version` 一处维护，文档里不写具体版本。
+给维护者和 AI 看的开发细节。用户文档在 [README.md](README.md)。
 
 ## 架构
 
@@ -91,9 +90,12 @@ Vercel 的 Go runtime 会**缓冲整段响应**：用 700ms 间隔 flush 的测�
 - 每条请求带自增 `id`，Go 侧按 id 回通知，Node 用 `Map<id, handler>` 分发，并发流不串；
 - `vercel.json` 用 `includeFiles: bin/**` 把二进制打进函数。
 
-注意：Vercel 只要配了 `buildCommand` 就要求静态输出目录非空，所以构建脚本会生成
-`public/robots.txt`（**不能放 index.html**，否则 `/` 会被静态文件抢走，拿不到和
-`/health` 同构的 JSON）。仓库里没有 `public/`。
+注意：根目录没有 `package.json`，一旦配了 `buildCommand`，Vercel 就用 `@vercel/static-build`
+处理根目录，它的 `validateDistDir` 要求输出目录（`outputDirectory`，缺省是 `dist`）**存在且
+非空**，否则报 `STATIC_BUILD_NO_OUT_DIR` / `STATIC_BUILD_EMPTY_OUT_DIR`。所以构建脚本要生成
+`public/robots.txt` 占位；**不能放 index.html**——静态文件优先于 `rewrites`（部署实例的
+`/robots.txt` 返回的是静态 etag），放了 `index.html` 就会抢走 `/`，拿不到和 `/health` 同构的
+JSON。仓库里没有 `public/`，`.gitignore` 和 `.vercelignore` 都排除它。
 
 ## 测试
 
