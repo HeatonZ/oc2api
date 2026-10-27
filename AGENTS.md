@@ -59,8 +59,10 @@ TLS 握手和等响应头；正文流式读取不设上限。注意：自定义 
   都可以删（均已实测）。
 - **工作目录写 `./`**：绝对路径会让模型以为自己能访问那个目录。由 `shape.go` 的
   `workdir` 常量填充。
-- **`tools` 不能为空**（去掉或置空直接 429）。实测**只发 `read` 一项就够**，所以现在只发
-  read，其余官方工具不发送。
+- **`tools` 必须是官方工具集整套**：`internal/shape/assets/tools.json` 里的 12 个（`edit`、
+  `glob`、`grep`、`question`、`read`、`shell`、`skill`、`subagent`、`webfetch`、`websearch`、
+  `write`、`execute`）缺一不可。去掉、置空或只挑几个（旧实现只发 `read`）都会被上游拒；
+  唯一的改动是每个工具的描述统一换成禁止调用（见下节）。
 - `stream: true` + `stream_options.include_usage`；`stream:false` 也 429，非流式在本地聚合。
 - `max_completion_tokens: 32000`。
 - `ses_` 会话 id：12 位倒序十六进制时间戳 + 14 位 base62。时间戳取当前毫秒，
@@ -68,14 +70,16 @@ TLS 握手和等响应头；正文流式读取不设上限。注意：自定义 
 
 提示词占位符只有四个：`{{MODEL}}`、`{{MODELNAME}}`、`{{DATE}}`、`{{WORKDIR}}`。
 
-请求头里 `x-opencode-project` 用固定哈希即可；`b3` / `traceparent` 不是必需。
+请求头里 `x-opencode-project` 用固定哈希即可；UA 固定 `opencode/latest/2.1.1/cli`（对齐 v2 通道的
+官方客户端）。`b3` / `traceparent` 官方客户端不发，实现里已经删掉，别再加回来。
 
 ## 工具整形
 
 1. 客户端声明的工具改名 `oc2api_<sanitized>`（`internal/shape` 的 `ToolPrefix`），
    响应侧按同一前缀还原；
-2. 官方工具只发 `read`，描述换成 "Reserved for the host runtime; do not call or select
-   this function."；
+2. 官方工具**整套发送**（12 个，见上节），但每个的描述都换成 "Reserved for the host runtime;
+   do not call or select this function. Use tools explicitly supplied by the user instead."，
+   客户端执行不了它们，真被选中也只能在响应侧丢掉；
 3. 客户端没声明任何工具时，system 末尾补一句“不要调用工具”；
 4. 兜底：`internal/protocol` 按 `index` 缓冲工具调用，确认不是 `oc2api_` 的整条丢弃，
    `finish_reason` 从 `tool_calls` 回退 `stop`；非流式没有正文时带更强提示重试一次。
