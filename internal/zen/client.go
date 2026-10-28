@@ -73,18 +73,24 @@ func bunClientHello() *utls.ClientHelloSpec {
 	}
 }
 
+// DialFunc 是底层拨号器：返回一条到 addr 的已建立连接（可以是直连，
+// 也可以是经代理 CONNECT/SOCKS5 打出的隧道）。uTLS 握手由 zen 自己完成。
+type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
 // Client 持有进程级配置，按请求给出上游地址与出口。
 //
 // 与上游的差别：上游在 New 里把 URL 和 transport 都固定住，一个进程只打一个
 // 上游、一个出口。fork 需要「每个请求各自的上游与出口」（Sub2API 里每个账号
 // 绑一个租约），所以这里只保留配置与按出口隔离的连接池，具体地址由 Target
-// 在每次调用时传入。
+// 在每次调用时传入。订阅池轮换时用 WithDial 换掉拨号器，uTLS 握手仍在隧道之上。
 type Client struct {
 	cfg config.Config
 	// 每个出口一套 transport：连接池必须按出口隔离，否则 A 出口的空闲连接
 	// 会被 B 复用，出口就串了。
 	mu         sync.Mutex
 	transports map[string]*http.Transport
+	// override 非空时忽略 target.Proxy，一律用这个拨号器（订阅池每请求换节点）。
+	override DialFunc
 }
 
 // New 按注入的配置组装上游客户端。
@@ -92,8 +98,25 @@ func New(cfg config.Config) *Client {
 	return &Client{cfg: cfg, transports: map[string]*http.Transport{}}
 }
 
+// WithDial 返回一个走指定拨号器的副本（订阅池轮换用）：连接不复用，
+// 每次请求都重新建隧道，否则同一连接会一直用同一个出口。
+func (c *Client) WithDial(d DialFunc) *Client {
+	return &Client{cfg: c.cfg, transports: map[string]*http.Transport{}, override: d}
+}
+
 // transportFor 返回该出口专属的 transport。
 func (c *Client) transportFor(proxy dial.Proxy) *http.Transport {
+	if c.override != nil {
+		const key = "dial-override"
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if existing, ok := c.transports[key]; ok {
+			return existing
+		}
+		created := newTransportWithDial(c.cfg.ZenConnectTimeout, c.override, true)
+		c.transports[key] = created
+		return created
+	}
 	key := proxy.URL
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -112,14 +135,27 @@ func (c *Client) transportFor(proxy dial.Proxy) *http.Transport {
 // 顺序是重点——先隧道后握手，上游看到的才是我们的 Bun ClientHello；
 // 反过来的话握手发生在代理解密之外，指纹到不了上游。
 func newTransport(connectTimeout time.Duration, proxy dial.Proxy) *http.Transport {
+	return newTransportWithDial(connectTimeout, func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dial.Dial(ctx, proxy, addr)
+	}, false)
+}
+
+// newTransportWithDial 用给定拨号器建 transport。noReuse 为真时禁用连接复用
+// （代理轮换场景必须如此，否则同一连接上会一直用同一个出口 IP）。
+func newTransportWithDial(connectTimeout time.Duration, dialFn DialFunc, noReuse bool) *http.Transport {
+	if dialFn == nil {
+		dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+		dialFn = dialer.DialContext
+	}
 	return &http.Transport{
 		ForceAttemptHTTP2:     false,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       90 * time.Second,
+		DisableKeepAlives:     noReuse,
 		ResponseHeaderTimeout: connectTimeout,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			// http:// 上游不经过 DialTLSContext，这条路径也要受超时约束。
-			conn, err := dial.Dial(ctx, proxy, addr)
+			conn, err := dialFn(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
@@ -136,7 +172,7 @@ func newTransport(connectTimeout time.Duration, proxy dial.Proxy) *http.Transpor
 				host = addr
 			}
 			// 先建隧道（或直连），再在它上面做 uTLS 握手。
-			conn, err := dial.Dial(ctx, proxy, addr)
+			conn, err := dialFn(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}

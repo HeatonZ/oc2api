@@ -3,6 +3,7 @@ package chat
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -10,20 +11,28 @@ import (
 
 	"oc2api/internal/config"
 	"oc2api/internal/protocol"
+	"oc2api/internal/proxypool"
 	"oc2api/internal/shape"
 	"oc2api/internal/zen"
 )
 
 // Service 持有一次对话需要的依赖，由 main 注入。
 type Service struct {
-	client  *zen.Client
-	targets *zen.Factory
-	debug   bool
+	client   *zen.Client
+	targets  *zen.Factory
+	proxies  *proxypool.Pool
+	attempts int
+	debug    bool
 }
 
-// New 注入上游客户端、请求级目标解析器与调试开关。
-func New(cfg config.Config, client *zen.Client, targets *zen.Factory) *Service {
-	return &Service{client: client, targets: targets, debug: cfg.Debug}
+// New 注入上游客户端、请求级目标解析器、订阅代理池与调试开关。
+// proxies 为 nil 时按 target 里的出口或直连走。
+func New(cfg config.Config, client *zen.Client, targets *zen.Factory, proxies *proxypool.Pool) *Service {
+	attempts := cfg.ProxyMaxAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+	return &Service{client: client, targets: targets, proxies: proxies, attempts: attempts, debug: cfg.Debug}
 }
 
 // Upstream 发起一次上游对话请求（上游只接受流式，非流式由调用方聚合）。
@@ -46,14 +55,75 @@ func (s *Service) UpstreamWithSession(ctx context.Context, payload map[string]an
 	if s.debug {
 		log.Printf("[chat] model=%s session=%s%s tools=%d body=%dB egress=%s base=%s", model, session, describeMessages(payload), countClientTools(payload), len(body), target.Proxy.Label(), target.Base)
 	}
-	resp, err := s.client.Chat(ctx, target, body, session)
-	if err != nil {
-		return nil, nil, err
+	// 请求自带的出口优先：那是调用方点名的租约，换成别的出口会打掉上游会话亲和。
+	if target.Proxy.Enabled() || s.proxies == nil {
+		resp, err := s.client.Chat(ctx, target, body, session)
+		if err != nil {
+			return nil, nil, err
+		}
+		if s.debug {
+			log.Printf("[chat] upstream status=%d retry-after=%s", resp.StatusCode, resp.Header.Get("Retry-After"))
+		}
+		return resp, renames, nil
 	}
-	if s.debug {
-		log.Printf("[chat] upstream status=%d retry-after=%s", resp.StatusCode, resp.Header.Get("Retry-After"))
+
+	// 订阅池：每次尝试取一个节点，429/403/5xx 就换下一个，最多 attempts 个。
+	var lastErr error
+	for i := 0; i < s.attempts; i++ {
+		entry, err := s.proxies.Take(ctx)
+		if err != nil {
+			// 订阅拉取失败不应让服务直接不可用：记录后退回直连。
+			if s.debug {
+				log.Printf("[chat] 代理池不可用（%v），本次退回直连", err)
+			}
+			resp, err := s.client.Chat(ctx, target, body, session)
+			if err != nil {
+				return nil, nil, err
+			}
+			return resp, renames, nil
+		}
+		resp, err := s.client.WithDial(entry.Dial).Chat(ctx, target, body, session)
+		if err != nil {
+			s.proxies.Report(entry, http.StatusBadGateway)
+			lastErr = err
+			if s.debug {
+				log.Printf("[chat] proxy=%s attempt=%d 传输失败: %v", entry.Label(), i+1, err)
+			}
+			continue
+		}
+		if s.debug {
+			log.Printf("[chat] proxy=%s attempt=%d upstream status=%d retry-after=%s",
+				entry.Label(), i+1, resp.StatusCode, resp.Header.Get("Retry-After"))
+		}
+		if retryableProxyStatus(resp.StatusCode) && i+1 < s.attempts {
+			s.proxies.Report(entry, resp.StatusCode)
+			if s.debug {
+				log.Printf("[chat] proxy=%s 返回 %d，换下一个出口", entry.Label(), resp.StatusCode)
+			}
+			drainAndClose(resp.Body)
+			continue
+		}
+		s.proxies.Report(entry, resp.StatusCode)
+		return resp, renames, nil
 	}
-	return resp, renames, nil
+	if lastErr == nil {
+		lastErr = errors.New("所有代理出口尝试均失败")
+	}
+	return nil, nil, lastErr
+}
+
+// retryableProxyStatus 表示该状态码更像「这个出口的额度/网络问题」，值得换一个出口。
+func retryableProxyStatus(status int) bool {
+	return status == http.StatusForbidden || status == http.StatusTooManyRequests || status >= 500
+}
+
+// drainAndClose 丢弃响应体并关闭连接，避免换出口时泄漏连接。
+func drainAndClose(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	_, _ = io.CopyN(io.Discard, body, 64<<10)
+	_ = body.Close()
 }
 
 // describeMessages 汇总消息角色，便于在日志里还原客户端请求形态。
